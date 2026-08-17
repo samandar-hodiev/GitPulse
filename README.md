@@ -569,7 +569,7 @@ Shunday qilib developer Telegram orqali barcha projectlaridagi activity'ni kuzat
 
 🚧 GitPulse hozir development bosqichida.
 
-Current status:
+Current status:!
 
 GitHub Webhook        ✅
 Telegram Notification ✅
