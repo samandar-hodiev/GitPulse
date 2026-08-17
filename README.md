@@ -560,7 +560,7 @@ git push
 
 qilganda GitPulse Telegramga avtomatik notification yuboradi.
 
-Shunday qilib developer Telegram orqali barcha projectlaridagi activity'ni kuzatishi mumkin.
+Shunday qilib developer Telegram orqali barcha projectlaridagi activity'ni kuzatishi mumkin.!!!
 
 ---
 

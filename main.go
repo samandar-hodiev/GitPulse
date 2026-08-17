@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,17 +14,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 )
 
-// ==============================
+// ============================================================
 // GITHUB TYPES
-// ==============================
+// ============================================================
 
 type GitHubPayload struct {
 	Ref string `json:"ref"`
@@ -51,12 +53,12 @@ type Commit struct {
 	Removed  []string `json:"removed"`
 }
 
-// ==============================
+// ============================================================
 // TELEGRAM TYPES
-// ==============================
+// ============================================================
 
 type TelegramUpdate struct {
-	UpdateID int `json:"update_id"`
+	UpdateID int64             `json:"update_id"`
 	Message  *TelegramMessage `json:"message"`
 }
 
@@ -71,60 +73,229 @@ type TelegramChat struct {
 	Type string `json:"type"`
 }
 
-// ==============================
-// PROJECT STORAGE
-// ==============================
+// ============================================================
+// DATABASE
+// ============================================================
 
-// Hozircha projectlar RAM'da saqlanadi.
-// Database keyin qo'shiladi.
+var db *sql.DB
 
-var (
-	projects   = make(map[string]bool)
-	projectsMu sync.RWMutex
-)
+// ============================================================
+// CONFIG
+// ============================================================
 
-// ==============================
+type Config struct {
+	TelegramBotToken    string
+	TelegramChatID      string
+	GitHubWebhookSecret string
+	DatabaseURL         string
+	Port                string
+}
+
+var config Config
+
+// ============================================================
 // MAIN
-// ==============================
+// ============================================================
 
 func main() {
-	// Load .env
+	// --------------------------------------------------------
+	// LOAD .ENV
+	// --------------------------------------------------------
+
 	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env file not found")
+		log.Println("⚠️ Warning: .env file not found")
 	}
 
-	// Required environment variables
-	if os.Getenv("TELEGRAM_BOT_TOKEN") == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN is missing")
+	loadConfig()
+
+	// --------------------------------------------------------
+	// DATABASE
+	// --------------------------------------------------------
+
+	if err := initDatabase(); err != nil {
+		log.Fatal("❌ Database initialization failed:", err)
 	}
 
-	if os.Getenv("TELEGRAM_CHAT_ID") == "" {
-		log.Fatal("TELEGRAM_CHAT_ID is missing")
+	defer db.Close()
+
+	if err := initDatabaseSchema(); err != nil {
+		log.Fatal("❌ Database schema initialization failed:", err)
 	}
 
-	if os.Getenv("GITHUB_WEBHOOK_SECRET") == "" {
-		log.Fatal("GITHUB_WEBHOOK_SECRET is missing")
+	// --------------------------------------------------------
+	// TELEGRAM
+	// --------------------------------------------------------
+
+	if err := deleteTelegramWebhook(); err != nil {
+		log.Println("⚠️ Telegram webhook cleanup warning:", err)
 	}
 
-	// HTTP routes
+	// --------------------------------------------------------
+	// HTTP ROUTES
+	// --------------------------------------------------------
+
 	http.HandleFunc("/health", health)
 	http.HandleFunc("/webhook/github", githubWebhook)
 
-	// Telegram bot polling
+	// --------------------------------------------------------
+	// TELEGRAM BOT
+	// --------------------------------------------------------
+
 	go startTelegramBot()
 
-	fmt.Println("⚡ GitPulse server started on :8080")
+	// --------------------------------------------------------
+	// SERVER
+	// --------------------------------------------------------
+
+	fmt.Printf(
+		"⚡ GitPulse server started on :%s\n",
+		config.Port,
+	)
 
 	log.Fatal(
-		http.ListenAndServe(":8080", nil),
+		http.ListenAndServe(
+			":"+config.Port,
+			nil,
+		),
 	)
 }
 
-// ==============================
-// HEALTH CHECK
-// ==============================
+// ============================================================
+// CONFIG
+// ============================================================
+
+func loadConfig() {
+	config = Config{
+		TelegramBotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatID:      os.Getenv("TELEGRAM_CHAT_ID"),
+		GitHubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		DatabaseURL:         os.Getenv("DATABASE_URL"),
+		Port:                os.Getenv("PORT"),
+	}
+
+	if config.TelegramBotToken == "" {
+		log.Fatal("❌ TELEGRAM_BOT_TOKEN is missing")
+	}
+
+	if config.TelegramChatID == "" {
+		log.Fatal("❌ TELEGRAM_CHAT_ID is missing")
+	}
+
+	if config.GitHubWebhookSecret == "" {
+		log.Fatal("❌ GITHUB_WEBHOOK_SECRET is missing")
+	}
+
+	if config.DatabaseURL == "" {
+		log.Fatal("❌ DATABASE_URL is missing")
+	}
+
+	if config.Port == "" {
+		config.Port = "8080"
+	}
+}
+
+// ============================================================
+// DATABASE INIT
+// ============================================================
+
+func initDatabase() error {
+	var err error
+
+	db, err = sql.Open(
+		"pgx",
+		config.DatabaseURL,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		return err
+	}
+
+	log.Println("🗄 PostgreSQL connected")
+
+	return nil
+}
+
+// ============================================================
+// DATABASE SCHEMA + MIGRATION
+// ============================================================
+
+func initDatabaseSchema() error {
+
+	// --------------------------------------------------------
+	// CREATE TABLE
+	// --------------------------------------------------------
+
+	createTableQuery := `
+	CREATE TABLE IF NOT EXISTS projects (
+		name TEXT PRIMARY KEY,
+		github_url TEXT NOT NULL DEFAULT '',
+		enabled BOOLEAN NOT NULL DEFAULT TRUE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	`
+
+	if _, err := db.Exec(createTableQuery); err != nil {
+		return err
+	}
+
+	// --------------------------------------------------------
+	// MIGRATION
+	//
+	// Old database'da projects table mavjud bo'lishi mumkin.
+	// Shuning uchun kerakli columnlarni qo'shamiz.
+	// --------------------------------------------------------
+
+	migrations := []string{
+		`
+		ALTER TABLE projects
+		ADD COLUMN IF NOT EXISTS github_url TEXT NOT NULL DEFAULT '';
+		`,
+
+		`
+		ALTER TABLE projects
+		ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
+		`,
+
+		`
+		ALTER TABLE projects
+		ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+		`,
+
+		`
+		ALTER TABLE projects
+		ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+		`,
+	}
+
+	for _, query := range migrations {
+		if _, err := db.Exec(query); err != nil {
+			return err
+		}
+	}
+
+	log.Println("🗄 Database schema ready")
+
+	return nil
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
 
 func health(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodGet {
 		http.Error(
 			w,
@@ -135,15 +306,39 @@ func health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(
+		r.Context(),
+		2*time.Second,
+	)
+
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		http.Error(
+			w,
+			"Database unavailable",
+			http.StatusServiceUnavailable,
+		)
+
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("GitPulse is running"))
+
+	_, _ = w.Write(
+		[]byte("GitPulse is running"),
+	)
 }
 
-// ==============================
+// ============================================================
 // GITHUB WEBHOOK
-// ==============================
+// ============================================================
 
-func githubWebhook(w http.ResponseWriter, r *http.Request) {
+func githubWebhook(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+
 	if r.Method != http.MethodPost {
 		http.Error(
 			w,
@@ -154,8 +349,10 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Request body'ni raw holatda o'qiymiz.
-	// HMAC signature tekshirish uchun kerak.
+	// --------------------------------------------------------
+	// READ RAW BODY
+	// --------------------------------------------------------
+
 	body, err := io.ReadAll(r.Body)
 
 	if err != nil {
@@ -168,16 +365,19 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// GitHub signature
+	// --------------------------------------------------------
+	// VERIFY GITHUB SIGNATURE
+	// --------------------------------------------------------
+
 	signature := r.Header.Get(
 		"X-Hub-Signature-256",
 	)
 
-	// Security check
 	if !verifyGitHubSignature(
 		body,
 		signature,
 	) {
+
 		log.Println(
 			"❌ Invalid GitHub webhook signature",
 		)
@@ -191,48 +391,59 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --------------------------------------------------------
+	// EVENT
+	// --------------------------------------------------------
+
 	event := r.Header.Get(
 		"X-GitHub-Event",
 	)
 
-	fmt.Println("=== GitHub Webhook ===")
-	fmt.Println("Event:", event)
+	log.Println("=== GitHub Webhook ===")
+	log.Println("Event:", event)
 
-	// ==============================
-	// PING EVENT
-	// ==============================
+	// --------------------------------------------------------
+	// PING
+	// --------------------------------------------------------
 
 	if event == "ping" {
-		fmt.Println(
+
+		log.Println(
 			"🏓 GitHub ping received",
 		)
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Ping received"))
+
+		_, _ = w.Write(
+			[]byte("Ping received"),
+		)
 
 		return
 	}
 
-	// ==============================
-	// EVENT FILTER
-	// ==============================
+	// --------------------------------------------------------
+	// ONLY PUSH EVENT
+	// --------------------------------------------------------
 
-	// Hozircha faqat push event kerak.
 	if event != "push" {
-		fmt.Println(
+
+		log.Println(
 			"Event ignored:",
 			event,
 		)
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Event ignored"))
+
+		_, _ = w.Write(
+			[]byte("Event ignored"),
+		)
 
 		return
 	}
 
-	// ==============================
+	// --------------------------------------------------------
 	// PARSE PAYLOAD
-	// ==============================
+	// --------------------------------------------------------
 
 	var payload GitHubPayload
 
@@ -240,6 +451,7 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		body,
 		&payload,
 	); err != nil {
+
 		http.Error(
 			w,
 			"Invalid JSON",
@@ -249,51 +461,134 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Empty commit check
+	// --------------------------------------------------------
+	// HEAD COMMIT
+	// --------------------------------------------------------
+
 	if payload.HeadCommit == nil {
+
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("No head commit"))
+
+		_, _ = w.Write(
+			[]byte("No head commit"),
+		)
 
 		return
 	}
 
-	// ==============================
+	// --------------------------------------------------------
 	// PROJECT
-	// ==============================
+	// --------------------------------------------------------
 
-	project := payload.Repository.Name
+	project := strings.TrimSpace(
+		payload.Repository.Name,
+	)
 
-	// Projectni registry'ga qo'shamiz.
-	registerProject(project)
+	if project == "" {
 
-	// ==============================
+		http.Error(
+			w,
+			"Project name missing",
+			http.StatusBadRequest,
+		)
+
+		return
+	}
+
+	githubURL := strings.TrimSpace(
+		payload.Repository.HTMLURL,
+	)
+
+	// --------------------------------------------------------
+	// REGISTER / UPDATE PROJECT
+	// --------------------------------------------------------
+
+	if err := registerProject(
+		project,
+		githubURL,
+	); err != nil {
+
+		log.Println(
+			"❌ Project registration error:",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Database error",
+			http.StatusInternalServerError,
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
+	// CHECK PROJECT STATUS
+	// --------------------------------------------------------
+
+	enabled, err := isProjectEnabled(
+		project,
+	)
+
+	if err != nil {
+
+		log.Println(
+			"❌ Project status error:",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Database error",
+			http.StatusInternalServerError,
+		)
+
+		return
+	}
+
+	if !enabled {
+
+		log.Println(
+			"🔕 Project muted:",
+			project,
+		)
+
+		w.WriteHeader(http.StatusOK)
+
+		_, _ = w.Write(
+			[]byte("Project muted"),
+		)
+
+		return
+	}
+
+	// --------------------------------------------------------
 	// BRANCH
-	// ==============================
+	// --------------------------------------------------------
 
 	branch := strings.TrimPrefix(
 		payload.Ref,
 		"refs/heads/",
 	)
 
-	// ==============================
-	// COMMIT
-	// ==============================
-
 	commit := *payload.HeadCommit
 
-	// ==============================
-	// CHANGES
-	// ==============================
+	// --------------------------------------------------------
+	// FILE CHANGES
+	// --------------------------------------------------------
 
 	added := len(commit.Added)
 	modified := len(commit.Modified)
 	removed := len(commit.Removed)
 
-	totalFiles := added + modified + removed
+	totalFiles :=
+		added +
+			modified +
+			removed
 
-	// ==============================
+	// --------------------------------------------------------
 	// TELEGRAM MESSAGE
-	// ==============================
+	// --------------------------------------------------------
 
 	message := formatTelegramMessage(
 		project,
@@ -305,45 +600,26 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		removed,
 	)
 
-	// ==============================
+	// --------------------------------------------------------
 	// LOG
-	// ==============================
+	// --------------------------------------------------------
 
-	fmt.Println(
-		"Project:",
-		project,
-	)
+	log.Println("📦 Project:", project)
+	log.Println("🌿 Branch:", branch)
+	log.Println("👤 Author:", commit.Author.Name)
+	log.Println("📝 Commit:", commit.Message)
+	log.Println("🔖 Commit ID:", commit.ID)
 
-	fmt.Println(
-		"Branch:",
-		branch,
-	)
-
-	fmt.Println(
-		"Author:",
-		commit.Author.Name,
-	)
-
-	fmt.Println(
-		"Commit:",
-		commit.Message,
-	)
-
-	fmt.Println(
-		"Commit ID:",
-		commit.ID,
-	)
-
-	// ==============================
+	// --------------------------------------------------------
 	// SEND TELEGRAM
-	// ==============================
+	// --------------------------------------------------------
 
 	if err := sendTelegramMessage(
 		message,
 	); err != nil {
 
 		log.Println(
-			"Telegram error:",
+			"❌ Telegram error:",
 			err,
 		)
 
@@ -356,44 +632,191 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Println(
+		"✅ Telegram notification sent",
+	)
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Webhook received"))
-}
 
-// ==============================
-// PROJECT REGISTRY
-// ==============================
-
-func registerProject(project string) {
-	project = strings.TrimSpace(project)
-
-	if project == "" {
-		return
-	}
-
-	projectsMu.Lock()
-	defer projectsMu.Unlock()
-
-	projects[project] = true
-
-	fmt.Println(
-		"📦 Project registered:",
-		project,
+	_, _ = w.Write(
+		[]byte("Webhook received"),
 	)
 }
 
-// ==============================
-// GITHUB SIGNATURE
-// ==============================
+// ============================================================
+// PROJECT REGISTRY
+// ============================================================
+
+func registerProject(
+	project string,
+	githubURL string,
+) error {
+
+	query := `
+		INSERT INTO projects (
+			name,
+			github_url
+		)
+		VALUES ($1, $2)
+		ON CONFLICT (name)
+		DO UPDATE SET
+			github_url = EXCLUDED.github_url,
+			updated_at = NOW()
+	`
+
+	_, err := db.Exec(
+		query,
+		project,
+		githubURL,
+	)
+
+	if err == nil {
+
+		log.Println(
+			"📦 Project registered:",
+			project,
+		)
+	}
+
+	return err
+}
+
+// ============================================================
+// PROJECT STATUS
+// ============================================================
+
+func isProjectEnabled(
+	project string,
+) (bool, error) {
+
+	var enabled bool
+
+	err := db.QueryRow(
+		`
+		SELECT enabled
+		FROM projects
+		WHERE name = $1
+		`,
+		project,
+	).Scan(&enabled)
+
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
+
+	return enabled, err
+}
+
+// ============================================================
+// GET PROJECTS
+// ============================================================
+
+type Project struct {
+	Name      string
+	GitHubURL string
+	Enabled   bool
+}
+
+func getProjects() ([]Project, error) {
+
+	rows, err := db.Query(
+		`
+		SELECT
+			name,
+			github_url,
+			enabled
+		FROM projects
+		ORDER BY name ASC
+		`,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	var projects []Project
+
+	for rows.Next() {
+
+		var project Project
+
+		if err := rows.Scan(
+			&project.Name,
+			&project.GitHubURL,
+			&project.Enabled,
+		); err != nil {
+
+			return nil, err
+		}
+
+		projects = append(
+			projects,
+			project,
+		)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return projects, nil
+}
+
+// ============================================================
+// UPDATE PROJECT STATUS
+// ============================================================
+
+func setProjectEnabled(
+	project string,
+	enabled bool,
+) error {
+
+	result, err := db.Exec(
+		`
+		UPDATE projects
+		SET
+			enabled = $1,
+			updated_at = NOW()
+		WHERE name = $2
+		`,
+		enabled,
+		project,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+
+		return fmt.Errorf(
+			"project not found: %s",
+			project,
+		)
+	}
+
+	return nil
+}
+
+// ============================================================
+// GITHUB HMAC SECURITY
+// ============================================================
 
 func verifyGitHubSignature(
 	body []byte,
 	signature string,
 ) bool {
 
-	secret := os.Getenv(
-		"GITHUB_WEBHOOK_SECRET",
-	)
+	secret :=
+		config.GitHubWebhookSecret
 
 	if secret == "" {
 		return false
@@ -412,12 +835,12 @@ func verifyGitHubSignature(
 		return false
 	}
 
-	receivedSignature := strings.TrimPrefix(
-		signature,
-		prefix,
-	)
+	receivedSignature :=
+		strings.TrimPrefix(
+			signature,
+			prefix,
+		)
 
-	// HMAC-SHA256
 	mac := hmac.New(
 		sha256.New,
 		[]byte(secret),
@@ -429,20 +852,20 @@ func verifyGitHubSignature(
 		return false
 	}
 
-	expectedSignature := hex.EncodeToString(
-		mac.Sum(nil),
-	)
+	expectedSignature :=
+		hex.EncodeToString(
+			mac.Sum(nil),
+		)
 
-	// Constant-time comparison.
 	return hmac.Equal(
 		[]byte(receivedSignature),
 		[]byte(expectedSignature),
 	)
 }
 
-// ==============================
+// ============================================================
 // TELEGRAM MESSAGE FORMAT
-// ==============================
+// ============================================================
 
 func formatTelegramMessage(
 	project string,
@@ -454,109 +877,86 @@ func formatTelegramMessage(
 	removed int,
 ) string {
 
-	// ==============================
-	// ESCAPE DATA
-	// ==============================
+	project =
+		html.EscapeString(project)
 
-	project = html.EscapeString(
-		project,
-	)
+	branch =
+		html.EscapeString(branch)
 
-	branch = html.EscapeString(
-		branch,
-	)
-
-	// ==============================
-	// AUTHOR
-	// ==============================
-
-	author := strings.TrimSpace(
-		commit.Author.Name,
-	)
+	author :=
+		strings.TrimSpace(
+			commit.Author.Name,
+		)
 
 	if author == "" {
 		author = "Unknown"
 	}
 
-	author = html.EscapeString(
-		author,
-	)
+	author =
+		html.EscapeString(author)
 
-	// ==============================
-	// COMMIT MESSAGE
-	// ==============================
-
-	commitMessage := strings.TrimSpace(
-		commit.Message,
-	)
+	commitMessage :=
+		strings.TrimSpace(
+			commit.Message,
+		)
 
 	if commitMessage == "" {
-		commitMessage = "No commit message"
+		commitMessage =
+			"No commit message"
 	}
 
-	commitMessage = html.EscapeString(
-		commitMessage,
-	)
-
-	// ==============================
-	// COMMIT ID
-	// ==============================
+	commitMessage =
+		html.EscapeString(
+			commitMessage,
+		)
 
 	commitID := commit.ID
 
 	if len(commitID) > 7 {
-		commitID = commitID[:7]
+		commitID =
+			commitID[:7]
 	}
 
-	commitID = html.EscapeString(
-		commitID,
-	)
+	commitID =
+		html.EscapeString(commitID)
 
-	// ==============================
-	// COMMIT URL
-	// ==============================
-
-	commitURL := html.EscapeString(
-		commit.URL,
-	)
-
-	// ==============================
-	// TIME
-	// ==============================
-
-	commitTime := commit.Timestamp
-
-	if parsedTime, err := time.Parse(
-		time.RFC3339,
-		commit.Timestamp,
-	); err == nil {
-
-		loc, err := time.LoadLocation(
-			"Asia/Tashkent",
+	commitURL :=
+		html.EscapeString(
+			commit.URL,
 		)
+
+	commitTime :=
+		commit.Timestamp
+
+	if parsedTime, err :=
+		time.Parse(
+			time.RFC3339,
+			commit.Timestamp,
+		); err == nil {
+
+		loc, err :=
+			time.LoadLocation(
+				"Asia/Tashkent",
+			)
 
 		if err == nil {
-			parsedTime = parsedTime.In(loc)
+			parsedTime =
+				parsedTime.In(loc)
 		}
 
-		commitTime = parsedTime.Format(
-			"02.01.2006 15:04",
-		)
+		commitTime =
+			parsedTime.Format(
+				"02.01.2006 15:04",
+			)
 	}
 
-	// ==============================
-	// FILE TEXT
-	// ==============================
-
-	fileText := "files changed"
+	fileText :=
+		"files changed"
 
 	if totalFiles == 1 {
-		fileText = "file changed"
+		fileText =
+			"file changed"
 	}
-
-	// ==============================
-	// FINAL MESSAGE
-	// ==============================
 
 	return fmt.Sprintf(
 		"🚀 <b>PUSH</b>\n\n"+
@@ -566,10 +966,14 @@ func formatTelegramMessage(
 			"📝 <b>%s</b>\n"+
 			"🔖 <code>%s</code>\n\n"+
 			"📊 <b>Changes</b>\n"+
-			"🟢 %d added  •  🟡 %d modified  •  🔴 %d removed\n"+
+			"🟢 %d added  •  "+
+			"🟡 %d modified  •  "+
+			"🔴 %d removed\n"+
 			"📁 %d %s\n\n"+
 			"🕐 %s\n\n"+
-			"🔗 <a href=\"%s\">View commit on GitHub</a>",
+			"🔗 <a href=\"%s\">"+
+			"View commit on GitHub"+
+			"</a>",
 
 		project,
 		branch,
@@ -586,58 +990,32 @@ func formatTelegramMessage(
 	)
 }
 
-// ==============================
-// TELEGRAM SEND MESSAGE
-// ==============================
+// ============================================================
+// TELEGRAM SEND
+// ============================================================
 
 func sendTelegramMessage(
 	message string,
 ) error {
 
-	chatID := os.Getenv(
-		"TELEGRAM_CHAT_ID",
-	)
-
-	if chatID == "" {
-		return fmt.Errorf(
-			"TELEGRAM_CHAT_ID is missing",
-		)
-	}
-
 	return sendTelegramMessageToChat(
-		chatID,
+		config.TelegramChatID,
 		message,
 	)
 }
 
-// ==============================
-// SEND TO SPECIFIC CHAT
-// ==============================
+// ============================================================
+// SEND TELEGRAM TO CHAT
+// ============================================================
 
 func sendTelegramMessageToChat(
 	chatID string,
 	message string,
 ) error {
 
-	token := os.Getenv(
-		"TELEGRAM_BOT_TOKEN",
-	)
-
-	if token == "" {
-		return fmt.Errorf(
-			"TELEGRAM_BOT_TOKEN is missing",
-		)
-	}
-
-	if chatID == "" {
-		return fmt.Errorf(
-			"chat ID is missing",
-		)
-	}
-
 	apiURL :=
 		"https://api.telegram.org/bot" +
-			token +
+			config.TelegramBotToken +
 			"/sendMessage"
 
 	data := url.Values{}
@@ -657,20 +1035,20 @@ func sendTelegramMessageToChat(
 		"HTML",
 	)
 
-	// Link preview'ni o'chiramiz.
 	data.Set(
 		"disable_web_page_preview",
 		"true",
 	)
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 15 * time.Second,
 	}
 
-	resp, err := client.PostForm(
-		apiURL,
-		data,
-	)
+	resp, err :=
+		client.PostForm(
+			apiURL,
+			data,
+		)
 
 	if err != nil {
 		return err
@@ -679,34 +1057,43 @@ func sendTelegramMessageToChat(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+
+		body, _ :=
+			io.ReadAll(resp.Body)
+
 		return fmt.Errorf(
-			"Telegram returned status: %s",
+			"Telegram returned %s: %s",
 			resp.Status,
+			string(body),
 		)
 	}
 
 	return nil
 }
 
-// ==============================
-// TELEGRAM BOT POLLING
-// ==============================
+// ============================================================
+// TELEGRAM BOT
+// ============================================================
 
 func startTelegramBot() {
-	fmt.Println(
+
+	log.Println(
 		"🤖 Telegram bot started",
 	)
 
-	offset := 0
+	offset := int64(0)
 
 	for {
-		updates, err := getTelegramUpdates(
-			offset,
-		)
+
+		updates, err :=
+			getTelegramUpdates(
+				offset,
+			)
 
 		if err != nil {
+
 			log.Println(
-				"Telegram polling error:",
+				"❌ Telegram polling error:",
 				err,
 			)
 
@@ -717,12 +1104,12 @@ func startTelegramBot() {
 			continue
 		}
 
-		for _, update := range updates {
+		for _, update :=
+			range updates {
 
-			// Keyingi update'dan boshlash.
-			offset = update.UpdateID + 1
+			offset =
+				update.UpdateID + 1
 
-			// Message bo'lmasa ignore.
 			if update.Message == nil {
 				continue
 			}
@@ -734,26 +1121,21 @@ func startTelegramBot() {
 	}
 }
 
-// ==============================
+// ============================================================
 // TELEGRAM GET UPDATES
-// ==============================
+// ============================================================
 
 func getTelegramUpdates(
-	offset int,
+	offset int64,
 ) ([]TelegramUpdate, error) {
-
-	token := os.Getenv(
-		"TELEGRAM_BOT_TOKEN",
-	)
 
 	apiURL :=
 		"https://api.telegram.org/bot" +
-			token +
+			config.TelegramBotToken +
 			"/getUpdates"
 
 	params := url.Values{}
 
-	// Long polling.
 	params.Set(
 		"timeout",
 		"30",
@@ -761,19 +1143,22 @@ func getTelegramUpdates(
 
 	params.Set(
 		"offset",
-		fmt.Sprintf(
-			"%d",
+		strconv.FormatInt(
 			offset,
+			10,
 		),
 	)
 
 	client := &http.Client{
-		Timeout: 35 * time.Second,
+		Timeout: 40 * time.Second,
 	}
 
-	resp, err := client.Get(
-		apiURL + "?" + params.Encode(),
-	)
+	resp, err :=
+		client.Get(
+			apiURL +
+				"?" +
+				params.Encode(),
+		)
 
 	if err != nil {
 		return nil, err
@@ -782,14 +1167,19 @@ func getTelegramUpdates(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+
+		body, _ :=
+			io.ReadAll(resp.Body)
+
 		return nil, fmt.Errorf(
-			"Telegram returned status: %s",
+			"Telegram returned %s: %s",
 			resp.Status,
+			string(body),
 		)
 	}
 
 	var response struct {
-		OK     bool             `json:"ok"`
+		OK     bool              `json:"ok"`
 		Result []TelegramUpdate `json:"result"`
 	}
 
@@ -801,6 +1191,7 @@ func getTelegramUpdates(
 	}
 
 	if !response.OK {
+
 		return nil, fmt.Errorf(
 			"Telegram API returned ok=false",
 		)
@@ -809,143 +1200,265 @@ func getTelegramUpdates(
 	return response.Result, nil
 }
 
-// ==============================
-// TELEGRAM MESSAGE HANDLER
-// ==============================
+// ============================================================
+// DELETE TELEGRAM WEBHOOK
+// ============================================================
+
+func deleteTelegramWebhook() error {
+
+	apiURL :=
+		"https://api.telegram.org/bot" +
+			config.TelegramBotToken +
+			"/deleteWebhook"
+
+	resp, err :=
+		http.PostForm(
+			apiURL,
+			url.Values{},
+		)
+
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+
+		body, _ :=
+			io.ReadAll(resp.Body)
+
+		return fmt.Errorf(
+			"Telegram webhook delete failed: %s: %s",
+			resp.Status,
+			string(body),
+		)
+	}
+
+	return nil
+}
+
+// ============================================================
+// TELEGRAM COMMAND HANDLER
+// ============================================================
 
 func handleTelegramMessage(
 	message *TelegramMessage,
 ) {
 
-	text := strings.TrimSpace(
-		message.Text,
+	text :=
+		strings.TrimSpace(
+			message.Text,
+		)
+
+	log.Println(
+		"📩 Telegram message:",
+		text,
 	)
 
-	switch text {
+	commandParts :=
+		strings.Fields(text)
+
+	if len(commandParts) == 0 {
+		return
+	}
+
+	command :=
+		strings.ToLower(
+			commandParts[0],
+		)
+
+	// /projects@GitPulseBot
+	if strings.Contains(
+		command,
+		"@",
+	) {
+
+		command =
+			strings.Split(
+				command,
+				"@",
+			)[0]
+	}
+
+	args :=
+		commandParts[1:]
+
+	switch command {
 
 	case "/start":
+
 		handleStartCommand(
 			message,
 		)
 
 	case "/projects":
+
 		handleProjectsCommand(
 			message,
 		)
 
+	case "/help":
+
+		handleHelpCommand(
+			message,
+		)
+
+	case "/mute":
+
+		handleMuteCommand(
+			message,
+			args,
+		)
+
+	case "/unmute":
+
+		handleUnmuteCommand(
+			message,
+			args,
+		)
+
 	default:
-		// Keyingi bosqichlarda
-		// /help va boshqa commandlar qo'shiladi.
+
+		_ = sendTelegramMessageToChat(
+			strconv.FormatInt(
+				message.Chat.ID,
+				10,
+			),
+			"❓ Unknown command.\n\n"+
+				"Use /help to see available commands.",
+		)
 	}
 }
 
-// ==============================
+// ============================================================
 // /START
-// ==============================
+// ============================================================
 
 func handleStartCommand(
 	message *TelegramMessage,
 ) {
 
-	chatID := fmt.Sprintf(
-		"%d",
-		message.Chat.ID,
-	)
+	chatID :=
+		strconv.FormatInt(
+			message.Chat.ID,
+			10,
+		)
 
-	startMessage :=
-		"🚀 <b>GitPulse</b>\n\n" +
-			"GitHub repository monitoring bot.\n\n" +
-			"📡 GitPulse GitHub'dagi push va commit'larni kuzatadi " +
-			"va Telegram orqali real-time notification yuboradi.\n\n" +
-			"📦 <b>Current features</b>\n" +
-			"• GitHub Webhook\n" +
-			"• Multi-project\n" +
-			"• Webhook Security\n" +
-			"• Commit notifications\n\n" +
-			"🛠 <b>Commands</b>\n" +
-			"/projects — projectlar\n" +
-			"/help — yordam"
+	text :=
+		"🚀 <b>GitPulse</b>\n\n"+
+			"GitHub repository monitoring bot.\n\n"+
+			"📡 GitHub push va commit'larni "+
+			"real-time Telegram notification'ga aylantiradi.\n\n"+
+			"📦 <b>Features</b>\n"+
+			"• GitHub Webhook\n"+
+			"• Multi-project\n"+
+			"• Webhook Security\n"+
+			"• PostgreSQL\n"+
+			"• Project Filtering\n\n"+
+			"🛠 <b>Commands</b>\n"+
+			"/projects\n"+
+			"/help\n"+
+			"/mute PROJECT\n"+
+			"/unmute PROJECT"
 
 	if err := sendTelegramMessageToChat(
 		chatID,
-		startMessage,
+		text,
 	); err != nil {
 
 		log.Println(
-			"Telegram /start error:",
+			"/start error:",
 			err,
 		)
 	}
 }
 
-// ==============================
+// ============================================================
+// /HELP
+// ============================================================
+
+func handleHelpCommand(
+	message *TelegramMessage,
+) {
+
+	chatID :=
+		strconv.FormatInt(
+			message.Chat.ID,
+			10,
+		)
+
+	text :=
+		"🛠 <b>GitPulse Commands</b>\n\n"+
+			"📦 <b>/projects</b>\n"+
+			"Registered projectlarni ko'rsatadi.\n\n"+
+			"🔕 <b>/mute PROJECT</b>\n"+
+			"Project notificationlarini o'chiradi.\n\n"+
+			"🔔 <b>/unmute PROJECT</b>\n"+
+			"Project notificationlarini yoqadi.\n\n"+
+			"❓ <b>/help</b>\n"+
+			"Yordam."
+
+	if err := sendTelegramMessageToChat(
+		chatID,
+		text,
+	); err != nil {
+
+		log.Println(
+			"/help error:",
+			err,
+		)
+	}
+}
+
+// ============================================================
 // /PROJECTS
-// ==============================
+// ============================================================
 
 func handleProjectsCommand(
 	message *TelegramMessage,
 ) {
 
-	chatID := fmt.Sprintf(
-		"%d",
-		message.Chat.ID,
-	)
-
-	// Read lock.
-	projectsMu.RLock()
-
-	projectList := make(
-		[]string,
-		0,
-		len(projects),
-	)
-
-	for project := range projects {
-		projectList = append(
-			projectList,
-			project,
+	chatID :=
+		strconv.FormatInt(
+			message.Chat.ID,
+			10,
 		)
-	}
 
-	projectsMu.RUnlock()
+	projectList, err :=
+		getProjects()
 
-	// ==============================
-	// NO PROJECTS
-	// ==============================
+	if err != nil {
 
-	if len(projectList) == 0 {
+		log.Println(
+			"❌ /projects database error:",
+			err,
+		)
 
-		text :=
-			"🚀 <b>GitPulse</b>\n\n" +
-				"📦 <b>Your Projects</b>\n\n" +
-				"No projects registered yet.\n\n" +
-				"Make a GitHub push to register a project."
-
-		if err := sendTelegramMessageToChat(
+		_ = sendTelegramMessageToChat(
 			chatID,
-			text,
-		); err != nil {
-
-			log.Println(
-				"Telegram /projects error:",
-				err,
-			)
-		}
+			"❌ Database error:\n"+
+				"<code>"+
+				html.EscapeString(
+					err.Error(),
+				)+
+				"</code>",
+		)
 
 		return
 	}
 
-	// ==============================
-	// SORT
-	// ==============================
+	if len(projectList) == 0 {
 
-	sort.Strings(
-		projectList,
-	)
+		_ = sendTelegramMessageToChat(
+			chatID,
+			"🚀 <b>GitPulse</b>\n\n"+
+				"📦 <b>Projects</b>\n\n"+
+				"No projects registered yet.",
+		)
 
-	// ==============================
-	// BUILD MESSAGE
-	// ==============================
+		return
+	}
 
 	var builder strings.Builder
 
@@ -954,41 +1467,62 @@ func handleProjectsCommand(
 	)
 
 	builder.WriteString(
-		"📦 <b>Your Projects</b>\n\n",
+		"📦 <b>Projects</b>\n\n",
 	)
 
-	for _, project := range projectList {
+	for _, project :=
+		range projectList {
 
-		project = html.EscapeString(
-			project,
-		)
+		name :=
+			html.EscapeString(
+				project.Name,
+			)
+
+		status :=
+			"🟢"
+
+		if !project.Enabled {
+			status = "🔕"
+		}
 
 		builder.WriteString(
-			"🟢 ",
+			fmt.Sprintf(
+				"%s <b>%s</b>\n",
+				status,
+				name,
+			),
 		)
 
-		builder.WriteString(
-			project,
-		)
+		if project.GitHubURL != "" {
 
-		builder.WriteString(
-			"\n",
-		)
+			urlText :=
+				html.EscapeString(
+					project.GitHubURL,
+				)
+
+			builder.WriteString(
+				fmt.Sprintf(
+					"   🔗 <a href=\"%s\">GitHub</a>\n",
+					urlText,
+				),
+			)
+		}
+
+		builder.WriteString("\n")
 	}
 
-	// ==============================
-	// TOTAL
-	// ==============================
-
 	builder.WriteString(
-		"\n📊 <b>Total:</b> ",
+		"📊 <b>Total:</b> ",
 	)
 
 	if len(projectList) == 1 {
+
 		builder.WriteString(
 			"1 project",
 		)
+
 	} else {
+
 		builder.WriteString(
 			fmt.Sprintf(
 				"%d projects",
@@ -997,18 +1531,136 @@ func handleProjectsCommand(
 		)
 	}
 
-	// ==============================
-	// SEND
-	// ==============================
-
 	if err := sendTelegramMessageToChat(
 		chatID,
 		builder.String(),
 	); err != nil {
 
 		log.Println(
-			"Telegram /projects error:",
+			"/projects Telegram error:",
 			err,
 		)
 	}
+}
+
+// ============================================================
+// /MUTE
+// ============================================================
+
+func handleMuteCommand(
+	message *TelegramMessage,
+	args []string,
+) {
+
+	chatID :=
+		strconv.FormatInt(
+			message.Chat.ID,
+			10,
+		)
+
+	if len(args) == 0 {
+
+		_ = sendTelegramMessageToChat(
+			chatID,
+			"Usage:\n"+
+				"<code>/mute Rent-House</code>",
+		)
+
+		return
+	}
+
+	project :=
+		strings.TrimSpace(
+			strings.Join(
+				args,
+				" ",
+			),
+		)
+
+	err := setProjectEnabled(
+		project,
+		false,
+	)
+
+	if err != nil {
+
+		_ = sendTelegramMessageToChat(
+			chatID,
+			"❌ Project not found:\n"+
+				"<code>"+
+				html.EscapeString(project)+
+				"</code>",
+		)
+
+		return
+	}
+
+	_ = sendTelegramMessageToChat(
+		chatID,
+		"🔕 <b>"+
+			html.EscapeString(project)+
+			"</b>\n\n"+
+			"Notifications disabled.",
+	)
+}
+
+// ============================================================
+// /UNMUTE
+// ============================================================
+
+func handleUnmuteCommand(
+	message *TelegramMessage,
+	args []string,
+) {
+
+	chatID :=
+		strconv.FormatInt(
+			message.Chat.ID,
+			10,
+		)
+
+	if len(args) == 0 {
+
+		_ = sendTelegramMessageToChat(
+			chatID,
+			"Usage:\n"+
+				"<code>/unmute Rent-House</code>",
+		)
+
+		return
+	}
+
+	project :=
+		strings.TrimSpace(
+			strings.Join(
+				args,
+				" ",
+			),
+		)
+
+	err := setProjectEnabled(
+		project,
+		true,
+	)
+
+	if err != nil {
+
+		_ = sendTelegramMessageToChat(
+			chatID,
+			"❌ Project not found:\n"+
+				"<code>"+
+				html.EscapeString(project)+
+				"</code>",
+		)
+
+		return
+	}
+
+	_ = sendTelegramMessageToChat(
+		chatID,
+		"🔔 <b>"+
+			html.EscapeString(project)+
+			"</b>\n\n"+
+			"Notifications enabled.",
+	)
 }
