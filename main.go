@@ -45,6 +45,34 @@ type Commit struct {
 	Removed  []string `json:"removed"`
 }
 
+// ==============================
+// TELEGRAM TYPES
+// ==============================
+
+type TelegramUpdate struct {
+	UpdateID int `json:"update_id"`
+
+	Message *TelegramMessage `json:"message"`
+}
+
+type TelegramMessage struct {
+	MessageID int `json:"message_id"`
+
+	Chat TelegramChat `json:"chat"`
+
+	Text string `json:"text"`
+}
+
+type TelegramChat struct {
+	ID int64 `json:"id"`
+
+	Type string `json:"type"`
+}
+
+// ==============================
+// MAIN
+// ==============================
+
 func main() {
 	// Load .env
 	if err := godotenv.Load(); err != nil {
@@ -64,9 +92,12 @@ func main() {
 		log.Fatal("GITHUB_WEBHOOK_SECRET is missing")
 	}
 
-	// Routes
+	// HTTP routes
 	http.HandleFunc("/health", health)
 	http.HandleFunc("/webhook/github", githubWebhook)
+
+	// Start Telegram bot polling in background.
+	go startTelegramBot()
 
 	fmt.Println("⚡ GitPulse server started on :8080")
 
@@ -107,8 +138,8 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read raw request body.
-	// We need the raw body for HMAC signature verification.
+	// Read raw body.
+	// We need it for HMAC verification.
 	body, err := io.ReadAll(r.Body)
 
 	if err != nil {
@@ -121,11 +152,10 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// GitHub webhook signature.
+	// GitHub signature.
 	signature := r.Header.Get("X-Hub-Signature-256")
 
-	// Verify that the request actually came
-	// from a GitHub webhook with our secret.
+	// Verify GitHub request.
 	if !verifyGitHubSignature(body, signature) {
 		log.Println("❌ Invalid GitHub webhook signature")
 
@@ -144,7 +174,7 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Event:", event)
 
 	// ==============================
-	// PING EVENT
+	// PING
 	// ==============================
 
 	if event == "ping" {
@@ -160,7 +190,6 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	// EVENT FILTER
 	// ==============================
 
-	// GitPulse currently processes only push events.
 	if event != "push" {
 		fmt.Println("Event ignored:", event)
 
@@ -186,7 +215,6 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// GitHub may send events without a head commit.
 	if payload.HeadCommit == nil {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("No head commit"))
@@ -240,7 +268,7 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// ==============================
-	// SERVER LOG
+	// LOG
 	// ==============================
 
 	fmt.Println("Project:", project)
@@ -299,7 +327,7 @@ func verifyGitHubSignature(
 		prefix,
 	)
 
-	// Create HMAC-SHA256 hash using our secret.
+	// Create HMAC-SHA256.
 	mac := hmac.New(
 		sha256.New,
 		[]byte(secret),
@@ -315,7 +343,7 @@ func verifyGitHubSignature(
 		mac.Sum(nil),
 	)
 
-	// Constant-time comparison.
+	// Secure constant-time comparison.
 	return hmac.Equal(
 		[]byte(receivedSignature),
 		[]byte(expectedSignature),
@@ -323,7 +351,7 @@ func verifyGitHubSignature(
 }
 
 // ==============================
-// TELEGRAM MESSAGE
+// TELEGRAM MESSAGE FORMAT
 // ==============================
 
 func formatTelegramMessage(
@@ -335,10 +363,6 @@ func formatTelegramMessage(
 	modified int,
 	removed int,
 ) string {
-
-	// ==============================
-	// ESCAPE USER/REMOTE DATA
-	// ==============================
 
 	project = html.EscapeString(project)
 	branch = html.EscapeString(branch)
@@ -430,7 +454,7 @@ func formatTelegramMessage(
 	}
 
 	// ==============================
-	// FINAL MESSAGE
+	// MESSAGE
 	// ==============================
 
 	return fmt.Sprintf(
@@ -462,12 +486,34 @@ func formatTelegramMessage(
 }
 
 // ==============================
-// TELEGRAM API
+// TELEGRAM SEND MESSAGE
 // ==============================
 
 func sendTelegramMessage(message string) error {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+
+	if chatID == "" {
+		return fmt.Errorf(
+			"TELEGRAM_CHAT_ID is missing",
+		)
+	}
+
+	return sendTelegramMessageToChat(
+		chatID,
+		message,
+	)
+}
+
+// ==============================
+// SEND TO SPECIFIC CHAT
+// ==============================
+
+func sendTelegramMessageToChat(
+	chatID string,
+	message string,
+) error {
+
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 
 	if token == "" {
 		return fmt.Errorf(
@@ -477,7 +523,7 @@ func sendTelegramMessage(message string) error {
 
 	if chatID == "" {
 		return fmt.Errorf(
-			"TELEGRAM_CHAT_ID is missing",
+			"chat ID is missing",
 		)
 	}
 
@@ -485,10 +531,6 @@ func sendTelegramMessage(message string) error {
 		"https://api.telegram.org/bot" +
 			token +
 			"/sendMessage"
-
-	// ==============================
-	// REQUEST DATA
-	// ==============================
 
 	data := url.Values{}
 
@@ -507,23 +549,15 @@ func sendTelegramMessage(message string) error {
 		"HTML",
 	)
 
-	// Disable Telegram automatic link preview.
+	// Disable link preview.
 	data.Set(
 		"disable_web_page_preview",
 		"true",
 	)
 
-	// ==============================
-	// HTTP CLIENT
-	// ==============================
-
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
-
-	// ==============================
-	// REQUEST
-	// ==============================
 
 	resp, err := client.PostForm(
 		apiURL,
@@ -536,10 +570,6 @@ func sendTelegramMessage(message string) error {
 
 	defer resp.Body.Close()
 
-	// ==============================
-	// TELEGRAM RESPONSE
-	// ==============================
-
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf(
 			"Telegram returned status: %s",
@@ -548,4 +578,173 @@ func sendTelegramMessage(message string) error {
 	}
 
 	return nil
+}
+
+// ==============================
+// TELEGRAM BOT
+// ==============================
+
+func startTelegramBot() {
+	fmt.Println("🤖 Telegram bot started")
+
+	offset := 0
+
+	for {
+		updates, err := getTelegramUpdates(offset)
+
+		if err != nil {
+			log.Println(
+				"Telegram polling error:",
+				err,
+			)
+
+			time.Sleep(3 * time.Second)
+
+			continue
+		}
+
+		for _, update := range updates {
+			// Move offset forward.
+			offset = update.UpdateID + 1
+
+			// Ignore updates without messages.
+			if update.Message == nil {
+				continue
+			}
+
+			handleTelegramMessage(
+				update.Message,
+			)
+		}
+	}
+}
+
+// ==============================
+// TELEGRAM GET UPDATES
+// ==============================
+
+func getTelegramUpdates(
+	offset int,
+) ([]TelegramUpdate, error) {
+
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+
+	apiURL :=
+		"https://api.telegram.org/bot" +
+			token +
+			"/getUpdates"
+
+	params := url.Values{}
+
+	params.Set(
+		"timeout",
+		"30",
+	)
+
+	params.Set(
+		"offset",
+		fmt.Sprintf("%d", offset),
+	)
+
+	client := &http.Client{
+		Timeout: 35 * time.Second,
+	}
+
+	resp, err := client.Get(
+		apiURL + "?" + params.Encode(),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(
+			"Telegram returned status: %s",
+			resp.Status,
+		)
+	}
+
+	var response struct {
+		OK     bool              `json:"ok"`
+		Result []TelegramUpdate  `json:"result"`
+	}
+
+	if err := json.NewDecoder(
+		resp.Body,
+	).Decode(&response); err != nil {
+
+		return nil, err
+	}
+
+	if !response.OK {
+		return nil, fmt.Errorf(
+			"Telegram API returned ok=false",
+		)
+	}
+
+	return response.Result, nil
+}
+
+// ==============================
+// TELEGRAM MESSAGE HANDLER
+// ==============================
+
+func handleTelegramMessage(
+	message *TelegramMessage,
+) {
+
+	text := strings.TrimSpace(
+		message.Text,
+	)
+
+	switch text {
+
+	case "/start":
+		handleStartCommand(message)
+
+	default:
+		// We will add /projects and /help later.
+	}
+}
+
+// ==============================
+// /start
+// ==============================
+
+func handleStartCommand(
+	message *TelegramMessage,
+) {
+
+	chatID := fmt.Sprintf(
+		"%d",
+		message.Chat.ID,
+	)
+
+	startMessage :=
+		"🚀 <b>GitPulse</b>\n\n" +
+			"GitHub repository monitoring bot.\n\n" +
+			"📡 GitPulse GitHub'dagi push va commit'larni kuzatadi " +
+			"va Telegram orqali real-time notification yuboradi.\n\n" +
+			"📦 <b>Current features</b>\n" +
+			"• GitHub Webhook\n" +
+			"• Multi-project\n" +
+			"• Webhook Security\n" +
+			"• Commit notifications\n\n" +
+			"🛠 <b>Commands</b>\n" +
+			"/projects — projectlar\n" +
+			"/help — yordam"
+
+	if err := sendTelegramMessageToChat(
+		chatID,
+		startMessage,
+	); err != nil {
+
+		log.Println(
+			"Telegram /start error:",
+			err,
+		)
+	}
 }
