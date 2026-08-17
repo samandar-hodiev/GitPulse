@@ -46,10 +46,12 @@ type Commit struct {
 }
 
 func main() {
+	// Load .env
 	if err := godotenv.Load(); err != nil {
 		log.Println("Warning: .env file not found")
 	}
 
+	// Required environment variables
 	if os.Getenv("TELEGRAM_BOT_TOKEN") == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN is missing")
 	}
@@ -62,6 +64,7 @@ func main() {
 		log.Fatal("GITHUB_WEBHOOK_SECRET is missing")
 	}
 
+	// Routes
 	http.HandleFunc("/health", health)
 	http.HandleFunc("/webhook/github", githubWebhook)
 
@@ -70,29 +73,59 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// ==============================
+// HEALTH CHECK
+// ==============================
+
 func health(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(
+			w,
+			"Method not allowed",
+			http.StatusMethodNotAllowed,
+		)
+
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("GitPulse is running"))
 }
 
+// ==============================
+// GITHUB WEBHOOK
+// ==============================
+
 func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(
+			w,
+			"Method not allowed",
+			http.StatusMethodNotAllowed,
+		)
+
 		return
 	}
 
-	// GitHub signature tekshirish uchun
-	// request body'ni avval raw holatda o'qiymiz.
+	// Read raw request body.
+	// We need the raw body for HMAC signature verification.
 	body, err := io.ReadAll(r.Body)
+
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		http.Error(
+			w,
+			"Failed to read request body",
+			http.StatusBadRequest,
+		)
+
 		return
 	}
 
-	// GitHub yuborgan signature.
+	// GitHub webhook signature.
 	signature := r.Header.Get("X-Hub-Signature-256")
 
-	// Request haqiqatan GitHub'dan kelganini tekshiramiz.
+	// Verify that the request actually came
+	// from a GitHub webhook with our secret.
 	if !verifyGitHubSignature(body, signature) {
 		log.Println("❌ Invalid GitHub webhook signature")
 
@@ -110,7 +143,10 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("=== GitHub Webhook ===")
 	fmt.Println("Event:", event)
 
-	// GitHub webhook yaratilganda ping event yuboradi.
+	// ==============================
+	// PING EVENT
+	// ==============================
+
 	if event == "ping" {
 		fmt.Println("🏓 GitHub ping received")
 
@@ -120,7 +156,11 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hozircha faqat push eventni ishlatamiz.
+	// ==============================
+	// EVENT FILTER
+	// ==============================
+
+	// GitPulse currently processes only push events.
 	if event != "push" {
 		fmt.Println("Event ignored:", event)
 
@@ -130,13 +170,23 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ==============================
+	// PARSE PAYLOAD
+	// ==============================
+
 	var payload GitHubPayload
 
 	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		http.Error(
+			w,
+			"Invalid JSON",
+			http.StatusBadRequest,
+		)
+
 		return
 	}
 
+	// GitHub may send events without a head commit.
 	if payload.HeadCommit == nil {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("No head commit"))
@@ -144,20 +194,40 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ==============================
+	// PROJECT
+	// ==============================
+
 	project := payload.Repository.Name
+
+	// ==============================
+	// BRANCH
+	// ==============================
 
 	branch := strings.TrimPrefix(
 		payload.Ref,
 		"refs/heads/",
 	)
 
+	// ==============================
+	// COMMIT
+	// ==============================
+
 	commit := *payload.HeadCommit
+
+	// ==============================
+	// CHANGES
+	// ==============================
 
 	added := len(commit.Added)
 	modified := len(commit.Modified)
 	removed := len(commit.Removed)
 
 	totalFiles := added + modified + removed
+
+	// ==============================
+	// TELEGRAM MESSAGE
+	// ==============================
 
 	message := formatTelegramMessage(
 		project,
@@ -169,11 +239,19 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		removed,
 	)
 
+	// ==============================
+	// SERVER LOG
+	// ==============================
+
 	fmt.Println("Project:", project)
 	fmt.Println("Branch:", branch)
 	fmt.Println("Author:", commit.Author.Name)
 	fmt.Println("Commit:", commit.Message)
 	fmt.Println("Commit ID:", commit.ID)
+
+	// ==============================
+	// SEND TELEGRAM
+	// ==============================
 
 	if err := sendTelegramMessage(message); err != nil {
 		log.Println("Telegram error:", err)
@@ -191,8 +269,10 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Webhook received"))
 }
 
-// verifyGitHubSignature GitHub yuborgan
-// X-Hub-Signature-256 headerini tekshiradi.
+// ==============================
+// GITHUB SIGNATURE VERIFICATION
+// ==============================
+
 func verifyGitHubSignature(
 	body []byte,
 	signature string,
@@ -219,8 +299,7 @@ func verifyGitHubSignature(
 		prefix,
 	)
 
-	// Biz GitHub secret yordamida
-	// request body uchun HMAC-SHA256 hisoblaymiz.
+	// Create HMAC-SHA256 hash using our secret.
 	mac := hmac.New(
 		sha256.New,
 		[]byte(secret),
@@ -236,13 +315,16 @@ func verifyGitHubSignature(
 		mac.Sum(nil),
 	)
 
-	// Oddiy == o'rniga hmac.Equal ishlatamiz.
-	// Bu timing attack'larga qarshi xavfsizroq.
+	// Constant-time comparison.
 	return hmac.Equal(
 		[]byte(receivedSignature),
 		[]byte(expectedSignature),
 	)
 }
+
+// ==============================
+// TELEGRAM MESSAGE
+// ==============================
 
 func formatTelegramMessage(
 	project string,
@@ -254,10 +336,20 @@ func formatTelegramMessage(
 	removed int,
 ) string {
 
+	// ==============================
+	// ESCAPE USER/REMOTE DATA
+	// ==============================
+
 	project = html.EscapeString(project)
 	branch = html.EscapeString(branch)
 
-	author := strings.TrimSpace(commit.Author.Name)
+	// ==============================
+	// AUTHOR
+	// ==============================
+
+	author := strings.TrimSpace(
+		commit.Author.Name,
+	)
 
 	if author == "" {
 		author = "Unknown"
@@ -265,13 +357,25 @@ func formatTelegramMessage(
 
 	author = html.EscapeString(author)
 
-	commitMessage := strings.TrimSpace(commit.Message)
+	// ==============================
+	// COMMIT MESSAGE
+	// ==============================
+
+	commitMessage := strings.TrimSpace(
+		commit.Message,
+	)
 
 	if commitMessage == "" {
 		commitMessage = "No commit message"
 	}
 
-	commitMessage = html.EscapeString(commitMessage)
+	commitMessage = html.EscapeString(
+		commitMessage,
+	)
+
+	// ==============================
+	// COMMIT ID
+	// ==============================
 
 	commitID := commit.ID
 
@@ -279,9 +383,21 @@ func formatTelegramMessage(
 		commitID = commitID[:7]
 	}
 
-	commitID = html.EscapeString(commitID)
+	commitID = html.EscapeString(
+		commitID,
+	)
 
-	commitURL := html.EscapeString(commit.URL)
+	// ==============================
+	// COMMIT URL
+	// ==============================
+
+	commitURL := html.EscapeString(
+		commit.URL,
+	)
+
+	// ==============================
+	// TIME
+	// ==============================
 
 	commitTime := commit.Timestamp
 
@@ -290,51 +406,64 @@ func formatTelegramMessage(
 		commit.Timestamp,
 	); err == nil {
 
-		loc, err := time.LoadLocation("Asia/Tashkent")
+		loc, err := time.LoadLocation(
+			"Asia/Tashkent",
+		)
 
 		if err == nil {
 			parsedTime = parsedTime.In(loc)
 		}
 
 		commitTime = parsedTime.Format(
-			"02.01.2006 15:04:05",
+			"02.01.2006 15:04",
 		)
 	}
 
+	// ==============================
+	// FILE TEXT
+	// ==============================
+
+	fileText := "files changed"
+
+	if totalFiles == 1 {
+		fileText = "file changed"
+	}
+
+	// ==============================
+	// FINAL MESSAGE
+	// ==============================
+
 	return fmt.Sprintf(
 		"🚀 <b>PUSH</b>\n\n"+
-			"📦 <b>Project</b>\n"+
-			"%s\n\n"+
-			"👤 <b>Author</b>\n"+
-			"%s\n\n"+
-			"🌿 <b>Branch</b>\n"+
-			"<code>%s</code>\n\n"+
-			"📝 <b>Commit</b>\n"+
-			"%s\n\n"+
-			"🔖 <b>Commit ID</b>\n"+
-			"<code>%s</code>\n\n"+
+			"📦 <b>%s</b>\n"+
+			"🌿 <code>%s</code>\n\n"+
+			"👤 %s\n\n"+
+			"📝 <b>%s</b>\n"+
+			"🔖 <code>%s</code>\n\n"+
 			"📊 <b>Changes</b>\n"+
-			"• %d files changed\n"+
-			"• 🟢 %d added\n"+
-			"• 🟡 %d modified\n"+
-			"• 🔴 %d removed\n\n"+
-			"🕐 <b>Time</b>\n"+
-			"%s\n\n"+
+			"🟢 %d added  •  🟡 %d modified  •  🔴 %d removed\n"+
+			"📁 %d %s\n\n"+
+			"🕐 %s\n\n"+
 			"🔗 <a href=\"%s\">View commit on GitHub</a>",
 
 		project,
-		author,
 		branch,
+		author,
 		commitMessage,
 		commitID,
-		totalFiles,
 		added,
 		modified,
 		removed,
+		totalFiles,
+		fileText,
 		commitTime,
 		commitURL,
 	)
 }
+
+// ==============================
+// TELEGRAM API
+// ==============================
 
 func sendTelegramMessage(message string) error {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -357,18 +486,44 @@ func sendTelegramMessage(message string) error {
 			token +
 			"/sendMessage"
 
+	// ==============================
+	// REQUEST DATA
+	// ==============================
+
 	data := url.Values{}
 
-	data.Set("chat_id", chatID)
-	data.Set("text", message)
-	data.Set("parse_mode", "HTML")
+	data.Set(
+		"chat_id",
+		chatID,
+	)
 
-	// Telegram link preview'ini o'chiramiz.
-	data.Set("disable_web_page_preview", "true")
+	data.Set(
+		"text",
+		message,
+	)
+
+	data.Set(
+		"parse_mode",
+		"HTML",
+	)
+
+	// Disable Telegram automatic link preview.
+	data.Set(
+		"disable_web_page_preview",
+		"true",
+	)
+
+	// ==============================
+	// HTTP CLIENT
+	// ==============================
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
+
+	// ==============================
+	// REQUEST
+	// ==============================
 
 	resp, err := client.PostForm(
 		apiURL,
@@ -380,6 +535,10 @@ func sendTelegramMessage(message string) error {
 	}
 
 	defer resp.Body.Close()
+
+	// ==============================
+	// TELEGRAM RESPONSE
+	// ==============================
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf(
