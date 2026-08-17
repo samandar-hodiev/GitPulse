@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -46,6 +50,18 @@ func main() {
 		log.Println("Warning: .env file not found")
 	}
 
+	if os.Getenv("TELEGRAM_BOT_TOKEN") == "" {
+		log.Fatal("TELEGRAM_BOT_TOKEN is missing")
+	}
+
+	if os.Getenv("TELEGRAM_CHAT_ID") == "" {
+		log.Fatal("TELEGRAM_CHAT_ID is missing")
+	}
+
+	if os.Getenv("GITHUB_WEBHOOK_SECRET") == "" {
+		log.Fatal("GITHUB_WEBHOOK_SECRET is missing")
+	}
+
 	http.HandleFunc("/health", health)
 	http.HandleFunc("/webhook/github", githubWebhook)
 
@@ -65,29 +81,58 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GitHub signature tekshirish uchun
+	// request body'ni avval raw holatda o'qiymiz.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// GitHub yuborgan signature.
+	signature := r.Header.Get("X-Hub-Signature-256")
+
+	// Request haqiqatan GitHub'dan kelganini tekshiramiz.
+	if !verifyGitHubSignature(body, signature) {
+		log.Println("❌ Invalid GitHub webhook signature")
+
+		http.Error(
+			w,
+			"Invalid webhook signature",
+			http.StatusUnauthorized,
+		)
+
+		return
+	}
+
 	event := r.Header.Get("X-GitHub-Event")
 
 	fmt.Println("=== GitHub Webhook ===")
 	fmt.Println("Event:", event)
 
-	// GitHub sends a "ping" event when webhook is created.
-	// We don't send Telegram notification for ping.
+	// GitHub webhook yaratilganda ping event yuboradi.
 	if event == "ping" {
+		fmt.Println("🏓 GitHub ping received")
+
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Ping received"))
+
 		return
 	}
 
-	// GitPulse processes only push events.
+	// Hozircha faqat push eventni ishlatamiz.
 	if event != "push" {
+		fmt.Println("Event ignored:", event)
+
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Event ignored"))
+
 		return
 	}
 
 	var payload GitHubPayload
 
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -95,6 +140,7 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 	if payload.HeadCommit == nil {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("No head commit"))
+
 		return
 	}
 
@@ -143,6 +189,59 @@ func githubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Webhook received"))
+}
+
+// verifyGitHubSignature GitHub yuborgan
+// X-Hub-Signature-256 headerini tekshiradi.
+func verifyGitHubSignature(
+	body []byte,
+	signature string,
+) bool {
+
+	secret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+
+	if secret == "" {
+		return false
+	}
+
+	if signature == "" {
+		return false
+	}
+
+	const prefix = "sha256="
+
+	if !strings.HasPrefix(signature, prefix) {
+		return false
+	}
+
+	receivedSignature := strings.TrimPrefix(
+		signature,
+		prefix,
+	)
+
+	// Biz GitHub secret yordamida
+	// request body uchun HMAC-SHA256 hisoblaymiz.
+	mac := hmac.New(
+		sha256.New,
+		[]byte(secret),
+	)
+
+	_, err := mac.Write(body)
+
+	if err != nil {
+		return false
+	}
+
+	expectedSignature := hex.EncodeToString(
+		mac.Sum(nil),
+	)
+
+	// Oddiy == o'rniga hmac.Equal ishlatamiz.
+	// Bu timing attack'larga qarshi xavfsizroq.
+	return hmac.Equal(
+		[]byte(receivedSignature),
+		[]byte(expectedSignature),
+	)
 }
 
 func formatTelegramMessage(
@@ -264,7 +363,7 @@ func sendTelegramMessage(message string) error {
 	data.Set("text", message)
 	data.Set("parse_mode", "HTML")
 
-	// Disable Telegram's automatic GitHub link preview.
+	// Telegram link preview'ini o'chiramiz.
 	data.Set("disable_web_page_preview", "true")
 
 	client := &http.Client{
