@@ -567,7 +567,7 @@ Shunday qilib developer Telegram orqali barcha projectlaridagi activity'ni kuzat
 
 # 📌 Project Status
 
-🚧 GitPulse hozir development bosqichida.
+🚧 GitPulse hozir development bosqichida.!!!
 
 Current status:
 
