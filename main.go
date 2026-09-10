@@ -769,6 +769,29 @@ func verifyGitHubSignature(
 // TELEGRAM MESSAGE FORMAT
 // ============================================================
 
+// maxCommitMessageRunes is the budget for the commit body inside one notification.
+// Telegram's hard limit is 4096 characters for the whole message; the rest of the
+// notification (title, repository, branch, author, counts, timestamp, link) plus HTML
+// escaping needs the remaining headroom.
+const maxCommitMessageRunes = 1500
+
+// truncateRunes shortens s to at most n runes, appending an ellipsis when it cuts.
+// It counts runes rather than bytes so a multi-byte character is never split in half,
+// which would produce invalid UTF-8 and be rejected.
+func truncateRunes(
+	s string,
+	n int,
+) string {
+
+	r := []rune(s)
+
+	if len(r) <= n {
+		return s
+	}
+
+	return string(r[:n]) + "..."
+}
+
 func formatTelegramMessage(
 	project string,
 	branch string,
@@ -806,6 +829,20 @@ func formatTelegramMessage(
 		commitMessage =
 			"No commit message"
 	}
+
+	// Telegram's sendMessage rejects anything over 4096 characters, and a long
+	// commit body is the only unbounded field in this notification. Truncate it
+	// BEFORE escaping: html.EscapeString can expand a character into five bytes,
+	// so trimming afterwards could still overshoot the limit.
+	//
+	// Truncating the commit body rather than the finished message keeps the HTML
+	// structure intact; cutting the rendered message could slice a tag in half and
+	// Telegram would reject that too.
+	commitMessage =
+		truncateRunes(
+			commitMessage,
+			maxCommitMessageRunes,
+		)
 
 	commitMessage =
 		html.EscapeString(
