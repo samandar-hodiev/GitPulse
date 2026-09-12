@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -322,6 +323,59 @@ func health(
 // GITHUB WEBHOOK
 // ============================================================
 
+// ============================================================
+// DUPLICATE SUPPRESSION
+// ============================================================
+
+// The same push can arrive twice. GitHub delivers it through the ngrok tunnel, and a
+// repository's own pre-push hook posts an identical, identically signed payload straight
+// to localhost. Both senders are wanted: the hook is what keeps notifications working
+// when the free ngrok URL goes stale and the registered webhook address is dead. Only the
+// first arrival should reach Telegram.
+//
+// Kept in memory rather than in the database. A restart may let one duplicate through,
+// which is a smaller price than a schema, a migration and a table for state that stops
+// being interesting after a few minutes.
+
+const duplicateWindow = 10 * time.Minute
+
+var (
+	seenMu      sync.Mutex
+	seenCommits = map[string]time.Time{}
+)
+
+// alreadyAnnounced reports whether this commit has already been announced inside the
+// window, and records it when it has not.
+//
+// Expired entries are dropped on the way through, so the map stays the size of recent
+// activity instead of growing for the life of the process.
+func alreadyAnnounced(
+	key string,
+) bool {
+
+	now := time.Now()
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+
+	for k, at := range seenCommits {
+
+		if now.Sub(at) > duplicateWindow {
+			delete(seenCommits, k)
+		}
+	}
+
+	if at, ok := seenCommits[key]; ok &&
+		now.Sub(at) <= duplicateWindow {
+
+		return true
+	}
+
+	seenCommits[key] = now
+
+	return false
+}
+
 func githubWebhook(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -522,6 +576,28 @@ func githubWebhook(
 	)
 
 	commit := *payload.HeadCommit
+
+	// --------------------------------------------------------
+	// DUPLICATE
+	// --------------------------------------------------------
+
+	if alreadyAnnounced(
+		branch + "@" + commit.ID,
+	) {
+
+		log.Println(
+			"🔁 Duplicate push ignored:",
+			commit.ID,
+		)
+
+		w.WriteHeader(http.StatusOK)
+
+		_, _ = w.Write(
+			[]byte("Duplicate ignored"),
+		)
+
+		return
+	}
 
 	// --------------------------------------------------------
 	// CHANGES
