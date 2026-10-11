@@ -269,6 +269,10 @@ func initDatabaseSchema() error {
 		return err
 	}
 
+	if err := initTopicsSchema(); err != nil {
+		return err
+	}
+
 	log.Println("🗄 Database schema ready")
 
 	return nil
@@ -659,7 +663,8 @@ func githubWebhook(
 	// SEND TELEGRAM
 	// --------------------------------------------------------
 
-	if err := sendTelegramMessage(
+	if err := sendProjectNotification(
+		project,
 		message,
 	); err != nil {
 
@@ -1002,21 +1007,6 @@ func formatTelegramMessage(
 		fileText,
 		commitTime,
 		commitURL,
-	)
-}
-
-// ============================================================
-// TELEGRAM SEND
-// ============================================================
-
-func sendTelegramMessage(
-	message string,
-) error {
-
-	return sendTelegramMessageToChat(
-		config.TelegramChatID,
-		message,
-		false,
 	)
 }
 
