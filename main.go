@@ -198,6 +198,9 @@ func main() {
 
 	go startTelegramBot()
 
+	// Turi noma'lum kanallarni Telegram'dan so'rab to'ldiramiz.
+	go refreshChannelTypes()
+
 	// --------------------------------------------------------
 	// SERVER
 	// --------------------------------------------------------
@@ -870,9 +873,8 @@ func githubWebhook(
 	if routed {
 
 		// Kanalda topic yo'q: xabar to'g'ridan-to'g'ri kanalga boradi.
-		sendErr = sendToThread(
-			channel.ChatID,
-			0,
+		sendErr = sendRouted(
+			channel,
 			message,
 		)
 
@@ -1707,10 +1709,27 @@ func handleTelegramMessage(
 	message *TelegramMessage,
 ) {
 
+	// Bot faqat shaxsiy chatda gapiradi.
+	//
+	// Guruhda javob berish ikkita yomon natija berardi: "Samandar Hodiev
+	// added you" kabi matnsiz xizmat xabariga "Unknown command" deb javob
+	// qaytarardi, va reply keyboard guruhdagi hamma uchun osilib qolardi.
+	// Guruh va kanal faqat push xabarlarini oladi.
+	if message.Chat.Type != "" &&
+		message.Chat.Type != "private" {
+
+		return
+	}
+
 	text :=
 		strings.TrimSpace(
 			message.Text,
 		)
+
+	// Matnsiz xabar (rasm, xizmat xabari) buyruq emas.
+	if text == "" {
+		return
+	}
 
 	log.Println(
 		"📩 Telegram message:",

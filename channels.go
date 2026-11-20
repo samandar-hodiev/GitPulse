@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"log"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +37,14 @@ type Channel struct {
 	ChatID    string
 	Title     string
 	Key       string
+	ChatType  string
 	CreatedAt time.Time
+}
+
+// isGroup — guruhda bot o'z nomidan yozadi va reply keyboard ko'rinadi;
+// kanalda esa xabar kanal nomidan chiqadi va tugmalar umuman bo'lmaydi.
+func (c Channel) isGroup() bool {
+	return c.ChatType == "group" || c.ChatType == "supergroup"
 }
 
 func initChannelsSchema() error {
@@ -48,6 +56,13 @@ func initChannelsSchema() error {
 		key        TEXT NOT NULL UNIQUE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	`); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`
+	ALTER TABLE channels
+	ADD COLUMN IF NOT EXISTS chat_type TEXT NOT NULL DEFAULT '';
 	`); err != nil {
 		return err
 	}
@@ -91,6 +106,7 @@ func newChannelKey() (string, error) {
 func ensureChannel(
 	chatID int64,
 	title string,
+	chatType string,
 ) (Channel, bool, error) {
 
 	id := strconv.FormatInt(chatID, 10)
@@ -98,23 +114,39 @@ func ensureChannel(
 	var channel Channel
 
 	err := db.QueryRow(
-		`SELECT chat_id, title, key FROM channels WHERE chat_id = $1`,
+		`SELECT chat_id, title, key, chat_type FROM channels WHERE chat_id = $1`,
 		id,
-	).Scan(&channel.ChatID, &channel.Title, &channel.Key)
+	).Scan(
+		&channel.ChatID,
+		&channel.Title,
+		&channel.Key,
+		&channel.ChatType,
+	)
 
 	if err == nil {
 
-		if title != "" && title != channel.Title {
+		if (title != "" && title != channel.Title) ||
+			(chatType != "" && chatType != channel.ChatType) {
+
+			if title == "" {
+				title = channel.Title
+			}
+
+			if chatType == "" {
+				chatType = channel.ChatType
+			}
 
 			if _, err := db.Exec(
-				`UPDATE channels SET title = $2 WHERE chat_id = $1`,
+				`UPDATE channels SET title = $2, chat_type = $3 WHERE chat_id = $1`,
 				id,
 				title,
+				chatType,
 			); err != nil {
 				return channel, false, err
 			}
 
 			channel.Title = title
+			channel.ChatType = chatType
 		}
 
 		return channel, false, nil
@@ -131,18 +163,20 @@ func ensureChannel(
 	}
 
 	if _, err := db.Exec(
-		`INSERT INTO channels (chat_id, title, key) VALUES ($1, $2, $3)`,
+		`INSERT INTO channels (chat_id, title, key, chat_type) VALUES ($1, $2, $3, $4)`,
 		id,
 		title,
 		key,
+		chatType,
 	); err != nil {
 		return Channel{}, false, err
 	}
 
 	return Channel{
-		ChatID: id,
-		Title:  title,
-		Key:    key,
+		ChatID:   id,
+		Title:    title,
+		Key:      key,
+		ChatType: chatType,
 	}, true, nil
 }
 
@@ -151,9 +185,14 @@ func channelByKey(key string) (Channel, error) {
 	var channel Channel
 
 	err := db.QueryRow(
-		`SELECT chat_id, title, key FROM channels WHERE key = $1`,
+		`SELECT chat_id, title, key, chat_type FROM channels WHERE key = $1`,
 		key,
-	).Scan(&channel.ChatID, &channel.Title, &channel.Key)
+	).Scan(
+		&channel.ChatID,
+		&channel.Title,
+		&channel.Key,
+		&channel.ChatType,
+	)
 
 	return channel, err
 }
@@ -161,7 +200,8 @@ func channelByKey(key string) (Channel, error) {
 func listChannels() ([]Channel, error) {
 
 	rows, err := db.Query(
-		`SELECT chat_id, title, key, created_at FROM channels ORDER BY created_at ASC`,
+		`SELECT chat_id, title, key, chat_type, created_at
+		 FROM channels ORDER BY created_at ASC`,
 	)
 
 	if err != nil {
@@ -180,6 +220,7 @@ func listChannels() ([]Channel, error) {
 			&channel.ChatID,
 			&channel.Title,
 			&channel.Key,
+			&channel.ChatType,
 			&channel.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -189,6 +230,85 @@ func listChannels() ([]Channel, error) {
 	}
 
 	return channels, rows.Err()
+}
+
+// refreshChannelTypes turi noma'lum kanallarni Telegram'dan so'rab to'ldiradi.
+//
+// Kerak, chunki chat turi keyinroq qo'shilgan: undan oldin ro'yxatga olingan
+// kanallarda bu maydon bo'sh qoladi, guruh esa kanaldan boshqacha ishlanadi.
+func refreshChannelTypes() {
+
+	channels, err := listChannels()
+
+	if err != nil {
+		log.Println("❌ Kanallarni o'qib bo'lmadi:", err)
+		return
+	}
+
+	for _, channel := range channels {
+
+		if channel.ChatType != "" {
+			continue
+		}
+
+		data := url.Values{}
+		data.Set("chat_id", channel.ChatID)
+
+		var chat struct {
+			Type  string `json:"type"`
+			Title string `json:"title"`
+		}
+
+		if err := telegramCall("getChat", data, &chat); err != nil {
+			log.Println("⚠️ getChat xatosi:", channel.ChatID, err)
+			continue
+		}
+
+		if _, err := db.Exec(
+			`UPDATE channels
+			 SET chat_type = $2,
+			     title = COALESCE(NULLIF($3, ''), title)
+			 WHERE chat_id = $1`,
+			channel.ChatID,
+			chat.Type,
+			chat.Title,
+		); err != nil {
+			log.Println("❌ Kanal turini saqlab bo'lmadi:", err)
+			continue
+		}
+
+		log.Println(
+			"📣 Kanal turi aniqlandi:",
+			chat.Title,
+			"→",
+			chat.Type,
+		)
+	}
+}
+
+// sendRouted push xabarini kanalga (yoki guruhga) yuboradi.
+//
+// Guruhga yuborilganda eski reply keyboard olib tashlanadi: bot bir marta
+// tugma ko'rsatgan bo'lsa, u guruhdagi hamma uchun osilib qolardi. Kanalda
+// reply keyboard umuman bo'lmaydi, shuning uchun u yerga bu maydon
+// yuborilmaydi.
+func sendRouted(
+	channel Channel,
+	message string,
+) error {
+
+	data := url.Values{}
+
+	data.Set("chat_id", channel.ChatID)
+	data.Set("text", message)
+	data.Set("parse_mode", "HTML")
+	data.Set("disable_web_page_preview", "true")
+
+	if channel.isGroup() {
+		data.Set("reply_markup", `{"remove_keyboard":true}`)
+	}
+
+	return telegramCall("sendMessage", data, nil)
 }
 
 // ============================================================
@@ -339,6 +459,27 @@ func handleMyChatMember(update *ChatMemberUpdated) {
 		status,
 	)
 
+	// Bot chiqarib yuborilsa yozuvni ham olib tashlaymiz: aks holda
+	// loyiha endi mavjud bo'lmagan chatga bog'langan bo'lib qolaveradi va
+	// har push 400 bilan tugaydi. Bog'lanishlar birga o'chadi (CASCADE).
+	if status == "left" || status == "kicked" {
+
+		if _, err := db.Exec(
+			`DELETE FROM channels WHERE chat_id = $1`,
+			strconv.FormatInt(update.Chat.ID, 10),
+		); err != nil {
+			log.Println("❌ Kanal yozuvini o'chirib bo'lmadi:", err)
+			return
+		}
+
+		log.Println(
+			"🗑 Kanal ro'yxatdan chiqarildi:",
+			update.Chat.Title,
+		)
+
+		return
+	}
+
 	if status != "administrator" {
 		return
 	}
@@ -346,6 +487,7 @@ func handleMyChatMember(update *ChatMemberUpdated) {
 	channel, created, err := ensureChannel(
 		update.Chat.ID,
 		update.Chat.Title,
+		chatType,
 	)
 
 	if err != nil {
@@ -414,6 +556,7 @@ func handleChannelPost(message *TelegramMessage) {
 	channel, _, err := ensureChannel(
 		message.Chat.ID,
 		message.Chat.Title,
+		message.Chat.Type,
 	)
 
 	if err != nil {
@@ -448,9 +591,21 @@ func channelConnectedText(channel Channel) string {
 		title = "Kanal"
 	}
 
+	// Guruhda xabar bot nomidan chiqadi va yonida "Admin" yozuvi turadi.
+	// Kanalda esa xabar kanal nomidan chiqadi — odatda kerakli ko'rinish
+	// shu, shuning uchun ogohlantiramiz.
+	warning := ""
+
+	if channel.isGroup() {
+		warning = "\n⚠️ Bu <b>guruh</b>, kanal emas. Guruhda xabar bot nomidan " +
+			"chiqadi. Xabar kanal nomidan chiqishi uchun kanal (channel) " +
+			"oching va botni o'sha yerga admin qiling.\n"
+	}
+
 	return fmt.Sprintf(
-		"✅ <b>Kanal ulandi</b>\n\n"+
-			"📣 <b>%s</b>\n"+
+		"✅ <b>Kanal ulandi</b>\n"+
+			warning+
+			"\n📣 <b>%s</b>\n"+
 			"🆔 <code>%s</code>\n"+
 			"🔑 <code>%s</code>\n\n"+
 			"<b>GitHub webhook</b> (Settings → Webhooks → Add webhook):\n"+
@@ -525,11 +680,18 @@ func handleChannelsCommand(message *TelegramMessage) {
 			title = "(nomsiz)"
 		}
 
+		kind := "kanal"
+
+		if channel.isGroup() {
+			kind = "guruh ⚠️"
+		}
+
 		builder.WriteString(
 			fmt.Sprintf(
-				"<b>%d. %s</b>\n🆔 <code>%s</code>\n🔑 <code>%s</code>\n",
+				"<b>%d. %s</b> — %s\n🆔 <code>%s</code>\n🔑 <code>%s</code>\n",
 				index+1,
 				title,
+				kind,
 				html.EscapeString(channel.ChatID),
 				html.EscapeString(channel.Key),
 			),
