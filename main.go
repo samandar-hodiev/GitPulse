@@ -1652,6 +1652,24 @@ func sendTelegramMessageToChat(
 // TELEGRAM BOT
 // ============================================================
 
+// redactToken matndan bot tokenini olib tashlaydi.
+//
+// net/http xatolari butun URL'ni o'z ichiga oladi, token esa URL ichida
+// turadi — ya'ni oddiy tarmoq uzilishi ham tokenni terminalga va log
+// fayliga chiqarib yuborardi.
+func redactToken(text string) string {
+
+	if config.TelegramBotToken == "" {
+		return text
+	}
+
+	return strings.ReplaceAll(
+		text,
+		config.TelegramBotToken,
+		"<token>",
+	)
+}
+
 func startTelegramBot() {
 
 	log.Println(
@@ -1671,7 +1689,7 @@ func startTelegramBot() {
 
 			log.Println(
 				"❌ Telegram polling error:",
-				err,
+				redactToken(err.Error()),
 			)
 
 			time.Sleep(

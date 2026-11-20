@@ -169,13 +169,21 @@ func TestFormatDeployMessageListsCommits(t *testing.T) {
 	records := []PushRecord{
 		{
 			SHA:         "d3afbaa125e",
+			Branch:      "main",
 			Subject:     "feat(console): agentliklar tab",
+			Author:      "samandar-hodiev",
 			CommittedAt: committed,
+			Added:       1,
+			Modified:    19,
+			Removed:     1,
 		},
 		{
 			SHA:         "02248d13988",
+			Branch:      "main",
 			Subject:     "feat(console): yig'ilgan menyuda papka",
+			Author:      "samandar-hodiev",
 			CommittedAt: committed.Add(-time.Hour),
+			Modified:    3,
 		},
 	}
 
@@ -199,15 +207,58 @@ func TestFormatDeployMessageListsCommits(t *testing.T) {
 		"2 ta o'zgarish",
 		"d3afbaa",
 		"menyuda papka",
+		"👤 samandar-hodiev",
+		"🟢 1 · 🟡 19 · 🔴 1 — 21 fayl",
+		"🌿 main",
+		"20.11.2026",
 	} {
 		if !strings.Contains(message, want) {
 			t.Errorf("deploy xabarida %q yo'q", want)
 		}
 	}
 
+	// Quote ochiq turishi kerak, yig'ilgan emas.
+	if !strings.Contains(message, "<blockquote>") {
+		t.Error("quote yo'q")
+	}
+
+	if strings.Contains(message, "blockquote expandable") {
+		t.Error("quote yig'ilgan holatda — deployda ochiq bo'lishi kerak")
+	}
+
 	// Push va deploy aralashmasligi kerak.
 	if strings.Contains(message, "COMMIT · PUSH") {
 		t.Error("deploy xabari push sarlavhasini olib qolibdi")
+	}
+}
+
+func TestFormatDeployMessageStaysUnderTelegramLimit(t *testing.T) {
+
+	var records []PushRecord
+
+	for i := 0; i < 60; i++ {
+		records = append(records, PushRecord{
+			SHA:         strings.Repeat("a", 40),
+			Branch:      "feature/juda-uzun-branch-nomi",
+			Subject:     strings.Repeat("uzun sarlavha ", 20),
+			Author:      "samandar-hodiev",
+			CommittedAt: time.Now(),
+			Modified:    12,
+		})
+	}
+
+	message := formatDeployMessage(
+		"uyjoy",
+		DeployPayload{Environment: "prod", URL: "https://uyjoy24.uz"},
+		records,
+	)
+
+	if len([]rune(message)) > 4096 {
+		t.Errorf("deploy xabari chegaradan uzun: %d", len([]rune(message)))
+	}
+
+	if !strings.Contains(message, "va yana") {
+		t.Error("ko'rsatilmagan commitlar soni yozilmadi")
 	}
 }
 

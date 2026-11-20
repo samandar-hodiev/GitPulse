@@ -163,9 +163,15 @@ Deploy tugagandan keyin loyiha papkasidan:
 | `-t <teg>` | Image tegi (standart: qisqa SHA) |
 | `-s failed` | Deploy yiqilganini bildiradi |
 
-GitPulse oxirgi deploydan beri kelgan barcha push'larni topadi, ro'yxat
-qilib yozadi va ularni "deploy qilindi" deb belgilaydi. Xabar kanalga
-**pin qilinadi** — push xabarlari pin qilinmaydi.
+GitPulse oxirgi deploydan beri kelgan barcha push'larni topadi va har birini
+to'liq yozadi: commit, branch, vaqt, muallif va qancha fayl tegilgani.
+Ro'yxat quote ichida, **ochiq holatda** turadi — bosish shart emas. Keyin
+o'sha commitlar "deploy qilindi" deb belgilanadi va xabar kanalga **pin
+qilinadi**. Push xabarlari pin qilinmaydi.
+
+Commitlar ko'p bo'lsa, ro'yxat 12 ta bilan (yoki 3000 belgi bilan)
+cheklanadi va oxirida "va yana N ta commit" deb yoziladi — Telegram 4096
+belgidan uzun xabarni qabul qilmaydi.
 
 ---
 
@@ -255,14 +261,18 @@ trailerlar esa tashlanadi.
 🌐 https://uyjoy24.uz
 🏷 d3afbaa
 
-📚 Shu deployga kirgan 3 ta o'zgarish
-🕐 20.11.2026 17:31 → 18:21
+📚 Shu deployga kirgan 2 ta o'zgarish
+🕐 20.11.2026 17:07 → 17:12
 
-▸ 20.11 18:21  d3afbaa  feat(console): Agentliklar — tab
-  20.11 18:06  02248d1  feat(console): yig'ilgan menyuda papka
-  20.11 17:31  0c92b24  fix(console): grafikdagi kalendar — dropdown
+▌🔖 5b149a4 · 🌿 main · 🕐 20.11.2026 17:12
+▌fix(auth): til almashganda ekran lipillamaydi
+▌👤 samandar-hodiev  ·  🟢 0 · 🟡 1 · 🔴 0 — 1 fayl
+▌
+▌🔖 6ca982c · 🌿 main · 🕐 20.11.2026 17:07
+▌feat(console): bosh panel grafigi — tepada, 24 soat va kalendar
+▌👤 samandar-hodiev  ·  🟢 8 · 🟡 19 · 🔴 0 — 27 fayl
 
-🕐 Deploy: 20.11.2026 18:42
+🕐 Deploy: 20.11.2026 19:41
 
 🔗 Deploy qilingan versiya
 ```

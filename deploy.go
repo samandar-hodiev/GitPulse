@@ -34,6 +34,14 @@ type PushRecord struct {
 	Author      string
 	URL         string
 	CommittedAt time.Time
+
+	Added    int
+	Modified int
+	Removed  int
+}
+
+func (r PushRecord) files() int {
+	return r.Added + r.Modified + r.Removed
 }
 
 func initDeploySchema() error {
@@ -52,6 +60,15 @@ func initDeploySchema() error {
 		deployed_at  TIMESTAMPTZ,
 		UNIQUE (project_key, sha)
 	);
+	`); err != nil {
+		return err
+	}
+
+	// Deploy xabarida har bir commit "qancha fayl tegdi" bilan ko'rinadi.
+	if _, err := db.Exec(`
+	ALTER TABLE pushes ADD COLUMN IF NOT EXISTS added    INT NOT NULL DEFAULT 0;
+	ALTER TABLE pushes ADD COLUMN IF NOT EXISTS modified INT NOT NULL DEFAULT 0;
+	ALTER TABLE pushes ADD COLUMN IF NOT EXISTS removed  INT NOT NULL DEFAULT 0;
 	`); err != nil {
 		return err
 	}
@@ -96,8 +113,9 @@ func recordPush(
 
 		if _, err := db.Exec(
 			`INSERT INTO pushes
-			 (project_key, sha, branch, subject, author, url, committed_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 (project_key, sha, branch, subject, author, url, committed_at,
+			  added, modified, removed)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			 ON CONFLICT (project_key, sha) DO NOTHING`,
 			projectKey,
 			commit.ID,
@@ -106,6 +124,9 @@ func recordPush(
 			commit.Author.Name,
 			commit.URL,
 			committedAt,
+			len(commit.Added),
+			len(commit.Modified),
+			len(commit.Removed),
 		); err != nil {
 
 			log.Println("⚠️ Push yozuvini saqlab bo'lmadi:", err)
@@ -122,7 +143,8 @@ func pendingPushes(
 
 	rows, err := db.Query(
 		`SELECT sha, branch, subject, author, url,
-		        COALESCE(committed_at, announced_at)
+		        COALESCE(committed_at, announced_at),
+		        added, modified, removed
 		 FROM pushes
 		 WHERE project_key = $1 AND deployed_at IS NULL
 		 ORDER BY COALESCE(committed_at, announced_at) DESC`,
@@ -148,6 +170,9 @@ func pendingPushes(
 			&record.Author,
 			&record.URL,
 			&record.CommittedAt,
+			&record.Added,
+			&record.Modified,
+			&record.Removed,
 		); err != nil {
 			return nil, err
 		}
@@ -406,8 +431,83 @@ func deployKey(path string) string {
 // DEPLOY XABARI
 // ============================================================
 
-// maxDeployCommits — deploy xabarida sanab o'tiladigan commitlar soni.
-const maxDeployCommits = 15
+// maxDeployCommits — deploy xabarida to'liq yoziladigan commitlar soni.
+const maxDeployCommits = 12
+
+// deployQuoteBudget — commitlar ro'yxatining belgilardagi chegarasi.
+// Telegram'ning 4096 belgisidan sarlavha, manzil va vaqt uchun joy
+// qolishi kerak.
+const deployQuoteBudget = 3000
+
+// commitEntry deployga kirgan bitta commitni uch qatorda yozadi:
+// qaysi commit va qachon, nima qilingan, qancha fayl tegilgan.
+func commitEntry(record PushRecord) string {
+
+	var builder strings.Builder
+
+	builder.WriteString(
+		"🔖 <code>" +
+			html.EscapeString(shortSHA(record.SHA)) +
+			"</code>",
+	)
+
+	if record.Branch != "" {
+		builder.WriteString(
+			" · 🌿 " + html.EscapeString(record.Branch),
+		)
+	}
+
+	if !record.CommittedAt.IsZero() {
+		builder.WriteString(
+			" · 🕐 " +
+				html.EscapeString(
+					localTime(record.CommittedAt).Format("02.01.2006 15:04"),
+				),
+		)
+	}
+
+	builder.WriteString("\n")
+
+	subject := record.Subject
+
+	if subject == "" {
+		subject = "(commit xabari yo'q)"
+	}
+
+	builder.WriteString(
+		"<b>" +
+			html.EscapeString(truncateRunes(subject, 120)) +
+			"</b>\n",
+	)
+
+	var details []string
+
+	if record.Author != "" {
+		details = append(
+			details,
+			"👤 "+html.EscapeString(record.Author),
+		)
+	}
+
+	if record.files() > 0 {
+		details = append(
+			details,
+			fmt.Sprintf(
+				"🟢 %d · 🟡 %d · 🔴 %d — %d fayl",
+				record.Added,
+				record.Modified,
+				record.Removed,
+				record.files(),
+			),
+		)
+	}
+
+	if len(details) > 0 {
+		builder.WriteString(strings.Join(details, "  ·  ") + "\n")
+	}
+
+	return builder.String()
+}
 
 func formatDeployMessage(
 	project string,
@@ -499,29 +599,31 @@ func formatDeployMessage(
 			shown = shown[:maxDeployCommits]
 		}
 
-		builder.WriteString("<blockquote expandable>")
+		// Quote yig'ilmagan: deploy kamdan-kam bo'ladi va ochganda nima
+		// chiqqani darhol ko'rinishi kerak.
+		builder.WriteString("<blockquote>")
 
-		for _, record := range shown {
+		for index, record := range shown {
 
-			when := ""
-
-			if !record.CommittedAt.IsZero() {
-				when = localTime(record.CommittedAt).Format("02.01 15:04") + "  "
+			if index > 0 {
+				builder.WriteString("\n")
 			}
 
-			builder.WriteString(
-				fmt.Sprintf(
-					"%s<code>%s</code>  %s\n",
-					html.EscapeString(when),
-					html.EscapeString(shortSHA(record.SHA)),
-					html.EscapeString(truncateRunes(record.Subject, 70)),
-				),
-			)
+			builder.WriteString(commitEntry(record))
+
+			// Telegram 4096 belgidan uzun xabarni qabul qilmaydi.
+			// Chegaraga yaqinlashsak, qolganini raqam bilan aytamiz.
+			if builder.Len() > deployQuoteBudget {
+
+				hidden += len(shown) - index - 1
+
+				break
+			}
 		}
 
 		if hidden > 0 {
 			builder.WriteString(
-				fmt.Sprintf("… +%d ta yana\n", hidden),
+				fmt.Sprintf("\n… va yana %d ta commit\n", hidden),
 			)
 		}
 

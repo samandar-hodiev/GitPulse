@@ -302,14 +302,17 @@ func telegramCallOnce(
 
 	resp, err := client.PostForm(apiURL, data)
 	if err != nil {
-		return err
+		// Transport xatosi butun URL'ni o'z ichiga oladi, URL ichida esa
+		// bot tokeni turadi. Logga chiqmasligi uchun shu yerda olib
+		// tashlanadi.
+		return errors.New(redactToken(err.Error()))
 	}
 
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return errors.New(redactToken(err.Error()))
 	}
 
 	var envelope struct {
