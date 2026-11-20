@@ -192,6 +192,10 @@ func main() {
 	mux.HandleFunc("/webhook/github", githubWebhook)
 	mux.HandleFunc("/webhook/github/", githubWebhook)
 
+	// Deploy — push'dan alohida hodisa: o'nlab push'dan keyin bitta
+	// deploy bo'ladi va kanalda boshqacha ko'rinadi.
+	mux.HandleFunc("/webhook/deploy/", deployWebhook)
+
 	// --------------------------------------------------------
 	// TELEGRAM BOT
 	// --------------------------------------------------------
@@ -341,6 +345,10 @@ func initDatabaseSchema() error {
 	}
 
 	if err := initChannelsSchema(); err != nil {
+		return err
+	}
+
+	if err := initDeploySchema(); err != nil {
 		return err
 	}
 
@@ -810,6 +818,16 @@ func githubWebhook(
 
 	added, modified, removed := changeCounts(commits)
 
+	// Deploy xabari "aynan qaysi o'zgarishlar chiqdi" deb yoza olishi
+	// uchun har bir commit yozib qo'yiladi.
+	deployKeyForProject := fullName
+
+	if deployKeyForProject == "" {
+		deployKeyForProject = project
+	}
+
+	recordPush(deployKeyForProject, branch, commits)
+
 	totalFiles :=
 		added +
 			modified +
@@ -1212,6 +1230,167 @@ func truncateRunes(
 	return string(r[:n]) + "..."
 }
 
+// maxCommitBodyRunes — commit tanasining chegarasi.
+//
+// Tana butunlay tashlanmaydi: "aynan nima o'zgardi va qanday muammo hal
+// qilindi" degan javob aynan o'sha yerda yozilgan bo'ladi. Lekin uzun
+// "Tekshirilgan:" ro'yxatlari kartochkani devorga aylantirib yuborardi,
+// shuning uchun chegara bor.
+const maxCommitBodyRunes = 600
+
+// maxBodyLines — tanadan ko'rsatiladigan qatorlar soni.
+const maxBodyLines = 10
+
+// maxListedFiles — kartochkada sanab o'tiladigan fayllar soni.
+const maxListedFiles = 12
+
+// localTime vaqtni Toshkent vaqtiga o'tkazadi.
+func localTime(t time.Time) time.Time {
+
+	loc, err := time.LoadLocation("Asia/Tashkent")
+
+	if err != nil {
+		return t
+	}
+
+	return t.In(loc)
+}
+
+// splitCommitMessage commit xabarini sarlavha va tanaga bo'ladi.
+//
+// Trailerlar (Co-Authored-By va shunga o'xshashlar) tashlanadi: ular
+// kartochkada joy egallaydi, lekin o'zgarish haqida hech narsa aytmaydi.
+func splitCommitMessage(
+	message string,
+) (string, string) {
+
+	message = strings.TrimSpace(message)
+
+	if message == "" {
+		return "", ""
+	}
+
+	lines := strings.Split(
+		strings.ReplaceAll(message, "\r\n", "\n"),
+		"\n",
+	)
+
+	subject := strings.TrimSpace(lines[0])
+
+	var body []string
+
+	for _, line := range lines[1:] {
+
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+
+		if strings.HasPrefix(lower, "co-authored-by:") ||
+			strings.HasPrefix(lower, "signed-off-by:") ||
+			strings.HasPrefix(lower, "reviewed-by:") ||
+			strings.HasPrefix(lower, "🤖 generated with") {
+
+			continue
+		}
+
+		body = append(body, line)
+	}
+
+	// Boshidagi va oxiridagi bo'sh qatorlarni olib tashlaymiz.
+	for len(body) > 0 && strings.TrimSpace(body[0]) == "" {
+		body = body[1:]
+	}
+
+	for len(body) > 0 && strings.TrimSpace(body[len(body)-1]) == "" {
+		body = body[:len(body)-1]
+	}
+
+	if len(body) > maxBodyLines {
+		body = append(body[:maxBodyLines], "…")
+	}
+
+	return subject, strings.Join(body, "\n")
+}
+
+// changedFilesBlock o'zgargan fayllarni yopiq ro'yxat qilib qaytaradi.
+//
+// "20 fayl o'zgardi" degani hech narsa aytmaydi; qaysi fayllar ekani esa
+// o'zgarishning nimaga tegishini bir qarashda ko'rsatadi. Ro'yxat
+// yig'ilgan holda turadi, shuning uchun kartochka uzaymaydi.
+func changedFilesBlock(
+	commits []Commit,
+) string {
+
+	type entry struct {
+		icon string
+		path string
+	}
+
+	seen := map[string]bool{}
+
+	var entries []entry
+
+	add := func(icon string, paths []string) {
+
+		for _, path := range paths {
+
+			if seen[path] {
+				continue
+			}
+
+			seen[path] = true
+
+			entries = append(entries, entry{icon: icon, path: path})
+		}
+	}
+
+	for _, commit := range commits {
+		add("🟢", commit.Added)
+	}
+
+	for _, commit := range commits {
+		add("🔴", commit.Removed)
+	}
+
+	for _, commit := range commits {
+		add("🟡", commit.Modified)
+	}
+
+	if len(entries) == 0 {
+		return ""
+	}
+
+	hidden := 0
+
+	if len(entries) > maxListedFiles {
+		hidden = len(entries) - maxListedFiles
+		entries = entries[:maxListedFiles]
+	}
+
+	var builder strings.Builder
+
+	builder.WriteString("<blockquote expandable>")
+
+	for _, item := range entries {
+
+		builder.WriteString(
+			item.icon +
+				" <code>" +
+				html.EscapeString(truncateRunes(item.path, 70)) +
+				"</code>\n",
+		)
+	}
+
+	if hidden > 0 {
+		builder.WriteString(
+			fmt.Sprintf("… +%d ta fayl\n", hidden),
+		)
+	}
+
+	builder.WriteString("</blockquote>")
+
+	return builder.String()
+}
+
 func formatTelegramMessage(
 	project string,
 	branch string,
@@ -1223,133 +1402,89 @@ func formatTelegramMessage(
 	removed int,
 ) string {
 
-	project =
-		html.EscapeString(project)
-
-	branch =
-		html.EscapeString(branch)
-
-	author :=
-		strings.TrimSpace(
-			commit.Author.Name,
-		)
+	author := strings.TrimSpace(commit.Author.Name)
 
 	if author == "" {
 		author = "Unknown"
 	}
 
-	author =
-		html.EscapeString(author)
+	subject, body := splitCommitMessage(commit.Message)
 
-	commitMessage :=
-		strings.TrimSpace(
-			commit.Message,
-		)
-
-	if commitMessage == "" {
-		commitMessage =
-			"No commit message"
+	if subject == "" {
+		subject = "(commit xabari yo'q)"
 	}
 
-	// Telegram's sendMessage rejects anything over 4096 characters, and a long
-	// commit body is the only unbounded field in this notification. Truncate it
-	// BEFORE escaping: html.EscapeString can expand a character into five bytes,
-	// so trimming afterwards could still overshoot the limit.
-	//
-	// Truncating the commit body rather than the finished message keeps the HTML
-	// structure intact; cutting the rendered message could slice a tag in half and
-	// Telegram would reject that too.
-	commitMessage =
-		truncateRunes(
-			commitMessage,
-			maxCommitMessageRunes,
-		)
+	// Telegram 4096 belgidan uzun xabarni qabul qilmaydi. Qisqartirish
+	// escape qilishdan OLDIN bajariladi: html.EscapeString bitta belgini
+	// beshtagacha cho'zishi mumkin, keyin qisqartirsak chegaradan
+	// oshib ketishimiz mumkin edi.
+	subject = truncateRunes(subject, 200)
+	body = truncateRunes(body, maxCommitBodyRunes)
 
-	commitMessage =
-		html.EscapeString(
-			commitMessage,
-		)
+	commitTime := commit.Timestamp
 
-	commitID := commit.ID
-
-	if len(commitID) > 7 {
-		commitID =
-			commitID[:7]
+	if parsed, err := time.Parse(
+		time.RFC3339,
+		commit.Timestamp,
+	); err == nil {
+		commitTime = localTime(parsed).Format("02.01.2006 15:04")
 	}
 
-	commitID =
-		html.EscapeString(commitID)
+	var builder strings.Builder
 
-	commitURL :=
-		html.EscapeString(
-			commit.URL,
-		)
+	// Push va deploy xabarlari bitta kanalda yonma-yon turadi, shuning
+	// uchun birinchi qatorning o'zidayoq qaysi biri ekani ko'rinishi
+	// kerak.
+	builder.WriteString("🟡 <b>COMMIT · PUSH</b>\n")
+	builder.WriteString("━━━━━━━━━━━━━━━\n\n")
 
-	commitTime :=
-		commit.Timestamp
-
-	if parsedTime, err :=
-		time.Parse(
-			time.RFC3339,
-			commit.Timestamp,
-		); err == nil {
-
-		loc, err :=
-			time.LoadLocation(
-				"Asia/Tashkent",
-			)
-
-		if err == nil {
-			parsedTime =
-				parsedTime.In(loc)
-		}
-
-		commitTime =
-			parsedTime.Format(
-				"02.01.2006 15:04",
-			)
-	}
-
-	fileText :=
-		"files changed"
-
-	if totalFiles == 1 {
-		fileText =
-			"file changed"
-	}
-
-	return fmt.Sprintf(
-		"🚀 <b>PUSH</b>\n\n"+
-			"📦 <b>%s</b>\n"+
-			"🌿 <code>%s</code>\n\n"+
-			"👤 %s\n\n"+
-			"📝 <b>%s</b>\n"+
-			"🔖 <code>%s</code>\n"+
-			"%s\n"+
-			"📊 <b>Changes</b>\n"+
-			"🟢 %d added  •  "+
-			"🟡 %d modified  •  "+
-			"🔴 %d removed\n"+
-			"📁 %d %s\n\n"+
-			"🕐 %s\n\n"+
-			"🔗 <a href=\"%s\">"+
-			"View commit on GitHub"+
-			"</a>",
-
-		project,
-		branch,
-		author,
-		commitMessage,
-		commitID,
-		otherCommitsBlock(commit, commits),
-		added,
-		modified,
-		removed,
-		totalFiles,
-		fileText,
-		commitTime,
-		commitURL,
+	builder.WriteString(
+		"📦 <b>" + html.EscapeString(project) + "</b>" +
+			" · 🌿 <code>" + html.EscapeString(branch) + "</code>\n",
 	)
+
+	builder.WriteString(
+		"👤 " + html.EscapeString(author) +
+			" · 🔖 <code>" + html.EscapeString(shortSHA(commit.ID)) + "</code>\n\n",
+	)
+
+	builder.WriteString(
+		"📝 <b>" + html.EscapeString(subject) + "</b>\n",
+	)
+
+	if body != "" {
+		builder.WriteString(
+			"\n" + html.EscapeString(body) + "\n",
+		)
+	}
+
+	builder.WriteString(otherCommitsBlock(commit, commits))
+
+	builder.WriteString(
+		fmt.Sprintf(
+			"\n📊 🟢 %d · 🟡 %d · 🔴 %d — %d fayl\n",
+			added,
+			modified,
+			removed,
+			totalFiles,
+		),
+	)
+
+	if files := changedFilesBlock(commits); files != "" {
+		builder.WriteString(files + "\n")
+	}
+
+	builder.WriteString("\n🕐 " + html.EscapeString(commitTime) + "\n")
+
+	if commit.URL != "" {
+		builder.WriteString(
+			"\n🔗 <a href=\"" +
+				html.EscapeString(commit.URL) +
+				"\">Commit'ni ko'rish</a>",
+		)
+	}
+
+	return builder.String()
 }
 
 // maxListedCommits — bitta xabarda sanab o'tiladigan qo'shimcha commitlar

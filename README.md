@@ -139,6 +139,33 @@ Tunnel yoki doimiy server.
 | GET | `/health` | Server va baza holati |
 | POST | `/webhook/github/<kalit>` | Kalitli webhook — kanal kalitdan aniqlanadi |
 | POST | `/webhook/github` | Eski yo'l: umumiy sir, kanal loyiha nomi bo'yicha |
+| POST | `/webhook/deploy/<kalit>` | Deploy e'loni — kanalga chiqadi va pin qilinadi |
+
+---
+
+## 🚀 Deploy xabari
+
+Har bir push'dan keyin deploy qilinmaydi — o'n-yigirma push'dan keyin bitta
+deploy bo'ladi. Shuning uchun deploy kanalda alohida ko'rinishda chiqadi va
+ichida o'sha deployga aynan qaysi o'zgarishlar kirgani sanab o'tiladi.
+
+Deploy tugagandan keyin loyiha papkasidan:
+
+```sh
+~/Desktop/gitpulse/gitpulse/scripts/gitpulse-deploy.sh -e prod -u https://uyjoy24.uz
+```
+
+| Argument | Nima |
+|---|---|
+| `-c <sha>` | Deploy qilingan commit (standart: HEAD) |
+| `-e <muhit>` | `prod`, `staging` (standart: `prod`) |
+| `-u <manzil>` | Sayt manzili |
+| `-t <teg>` | Image tegi (standart: qisqa SHA) |
+| `-s failed` | Deploy yiqilganini bildiradi |
+
+GitPulse oxirgi deploydan beri kelgan barcha push'larni topadi, ro'yxat
+qilib yozadi va ularni "deploy qilindi" deb belgilaydi. Xabar kanalga
+**pin qilinadi** — push xabarlari pin qilinmaydi.
 
 ---
 
@@ -147,8 +174,9 @@ Tunnel yoki doimiy server.
 | Jadval | Nima saqlaydi |
 |---|---|
 | `projects` | Ko'rilgan loyihalar (nomi, `owner/repo`, GitHub manzili) |
-| `channels` | Ulangan kanallar va kalitlari |
+| `channels` | Ulangan kanallar, kalitlari va turi (kanal / guruh) |
 | `project_channels` | Qaysi loyiha qaysi kanalga tushadi |
+| `pushes` | Har bir commit — deployga nima kirganini aniqlash uchun |
 | `project_topics` | Kanalsiz loyihalar uchun shaxsiy chatdagi topiclar |
 
 Sxema ishga tushganda avtomatik yaratiladi.
@@ -169,13 +197,16 @@ Sxema ishga tushganda avtomatik yaratiladi.
 
 ```
 gitpulse/
-├── main.go        HTTP server, GitHub webhook, Telegram bot
+├── main.go        HTTP server, GitHub webhook, Telegram bot, push kartochkasi
 ├── channels.go    Kanal registri, kalitlar, yo'naltirish
+├── deploy.go      Deploy e'loni, push yozuvlari, pin
 ├── topics.go      Shaxsiy chatdagi topiclar (kanalsiz loyihalar uchun)
+├── format_test.go Xabar formatining testlari
 ├── scripts/
 │   ├── run.sh             ishga tushirish
 │   ├── install-hook.sh    pre-push hook'ni istalgan loyihaga o'rnatish
-│   └── gitpulse-notify.sh hook chaqiradigan xabarchi
+│   ├── gitpulse-notify.sh hook chaqiradigan xabarchi
+│   └── gitpulse-deploy.sh deploy tugagach chaqiriladi
 ├── .env
 └── go.mod
 ```
@@ -184,28 +215,56 @@ gitpulse/
 
 ## 📱 Xabar ko'rinishi
 
+Push va deploy birinchi qatordanoq ajralib turadi.
+
+**Push** — 🟡 sariq, nima o'zgargani va qaysi fayllar tegilgani:
+
 ```
-🚀 PUSH
+🟡 COMMIT · PUSH
+━━━━━━━━━━━━━━━
 
-📦 uyjoy
-🌿 main
+📦 uyjoy · 🌿 main
+👤 samandar-hodiev · 🔖 0c92b24
 
-👤 samandar-hodiev
+📝 fix(console): grafikdagi kalendar — dropdown, kartochkani cho'zmaydi
 
-📝 fix(console): grafikdagi kalendar — dropdown
-🔖 0c92b24
+Kalendar paneli oqimda edi va ochilganda butun Dinamika kartochkasini
+pastga cho'zardi. Endi u tugma ostida suzadi.
 
-📚 Shu push'dagi yana 2 commit
-• 5b149a4 fix(auth): til almashganda ekran lipillamaydi
-• 6ca982c feat(console): bosh panel grafigi
+📊 🟢 1 · 🟡 2 · 🔴 0 — 3 fayl
+▸ 🟢 web/src/components/Calendar.tsx
+  🟡 web/src/app/page.tsx
+  🟡 web/src/lib/routes.ts
 
-📊 Changes
-🟢 1 added  •  🟡 3 modified  •  🔴 0 removed
-📁 4 files changed
+🕐 20.11.2026 17:31
 
-🕐 20.11.2026 18:03
+🔗 Commit'ni ko'rish
+```
 
-🔗 View commit on GitHub
+Commit tanasi saqlanadi (aynan nima hal qilingani o'sha yerda yozilgan),
+lekin 10 qator / 600 belgi bilan cheklanadi, `Co-Authored-By` kabi
+trailerlar esa tashlanadi.
+
+**Deploy** — 🟢 yashil, qaysi o'zgarishlar chiqqani vaqti bilan:
+
+```
+🟢🚀 DEPLOY
+━━━━━━━━━━━━━━━
+
+📦 uyjoy · prod
+🌐 https://uyjoy24.uz
+🏷 d3afbaa
+
+📚 Shu deployga kirgan 3 ta o'zgarish
+🕐 20.11.2026 17:31 → 18:21
+
+▸ 20.11 18:21  d3afbaa  feat(console): Agentliklar — tab
+  20.11 18:06  02248d1  feat(console): yig'ilgan menyuda papka
+  20.11 17:31  0c92b24  fix(console): grafikdagi kalendar — dropdown
+
+🕐 Deploy: 20.11.2026 18:42
+
+🔗 Deploy qilingan versiya
 ```
 
 Bitta push'da bir nechta commit bo'lsa, hammasi bitta xabarda ko'rinadi —
@@ -228,6 +287,7 @@ kanal o'nta kartochka bilan to'lib ketmaydi.
 | Bot buyruqlari | ✅ |
 | Lokal pre-push hook | ✅ |
 | Rate limit (429) ishlovi | ✅ |
-| Testlar | ⬜ |
+| Deploy e'loni + pin | ✅ |
+| Xabar formati testlari | ✅ |
 | Doimiy server / tunnel | ⬜ |
 | Pull Request, Issue, CI xabarlari | ⬜ |
