@@ -2,581 +2,232 @@
 
 **Author:** Samandar Hodiev
 
-GitPulse — GitHub repository'laridagi `push` va `commit` o'zgarishlarini kuzatib, ularni Telegram orqali real-time notification ko'rinishida yuboradigan Go backend application.
+GitPulse — GitHub repository'laridagi `push` va `commit` o'zgarishlarini kuzatib,
+har bir loyihaning xabarini **o'z Telegram kanaliga** yuboradigan Go backend.
 
-GitPulse bir nechta GitHub projectlarini bitta Telegram bot orqali kuzatish uchun mo'ljallangan.
+Bitta bot — bir nechta loyiha, bir nechta kanal. uyjoy24 kanaliga faqat uyjoy'ning
+push'lari, selfstudy kanaliga faqat selfstudy'niki tushadi.
 
 ---
 
-## 📌 GitPulse nima?
+## 📌 Qanday ishlaydi
 
-GitPulse — GitHub va Telegram o'rtasidagi notification bridge.
-
-Developer GitHub repository'ga `git push` qilganda:
-
-Developer
-    ↓
-git commit
-    ↓
+```
 git push
-    ↓
-GitHub
-    ↓
-GitHub Webhook
-    ↓
-GitPulse
-    ↓
-Telegram Bot
-    ↓
-Developer
+   ↓
+GitHub ──► webhook ──┐
+                     ├──► GitPulse ──► kanal kaliti ──► o'sha loyihaning kanali
+pre-push hook ───────┘       :8080
+```
 
-GitPulse GitHub webhook orqali kelgan ma'lumotlarni qabul qiladi, qayta ishlaydi va Telegram orqali notification yuboradi.
+Ikkala yo'l bir vaqtda ishlashi mumkin: GitHub webhook'i (ngrok yoki tunnel orqali)
+va loyihaning o'z `pre-push` hook'i (to'g'ridan-to'g'ri `localhost`ga). Bir xil
+commit ikki marta kelsa, GitPulse ikkinchisini tashlab yuboradi.
 
 ---
 
-## 🎯 Asosiy vazifasi
+## 🔑 Kanal kaliti
 
-GitPulse'ning asosiy vazifasi — GitHub'dagi yangi push va commit'larni avtomatik kuzatish va developerga Telegram orqali xabar berish.
+Har bir kanal GitPulse'da bitta kalit bilan ro'yxatdan o'tadi:
+`gp_` + 32 ta belgi. Kalit ikkita ishni bajaradi:
 
-Masalan:
+1. GitHub webhook imzosining siri (HMAC-SHA256)
+2. push qaysi kanalga tushishini aniqlaydi
 
-🚀 PUSH
+Shuning uchun **yangi loyihani ulash uchun bitta satr yetarli** — o'sha kalit.
+Har bir kanalning kaliti alohida: biri sizib ketsa, qolganlari ta'sirlanmaydi.
 
-📦 Project
-Rent-House
-
-👤 Author
-samandar-hodiev
-
-🌿 Branch
-main
-
-📝 Commit
-feat: add apartment recommendations
-
-🔖 Commit ID
-a0aa5b1
-
-📊 Changes
-• 3 files changed
-• 🟢 1 added
-• 🟡 2 modified
-• 🔴 0 removed
-
-🕐 Time
-17.08.2026 15:38:32
-
-🔗 View commit on GitHub
+Kalit hech qachon kanalga yozilmaydi — u bot bilan shaxsiy chatga keladi.
 
 ---
 
-# ✨ Asosiy imkoniyatlar
+## 🆕 Yangi loyihani ulash
 
-## 1. GitHub Webhook
+### 1. Kanal oching va botni admin qiling
 
-GitPulse GitHub repository'dan webhook orqali eventlarni qabul qiladi.
+Bot admin bo'lishi bilan kalit shaxsiy chatga keladi.
 
-Hozirgi asosiy event:
+Agar bot GitPulse ishlamay turgan paytda qo'shilgan bo'lsa — kanalda
+`/connect` deb yozing, kalit o'sha zahoti keladi.
 
-- `push`
+### 2. Loyihani kalitga bog'lang
 
-GitHub webhook request yuborganda GitPulse uni JSON orqali parse qiladi.
+**Lokal hook** (ngrok kerak emas, kompyuter yoniq bo'lsa ishlaydi):
 
----
+```sh
+cd ~/Desktop/<loyiha>
+~/Desktop/gitpulse/gitpulse/scripts/install-hook.sh gp_xxxxxxxx
+```
 
-## 2. Real-time Telegram Notification
+Kalit repo ichidagi faylga emas, `.git/config` ga yoziladi — commit'ga tushmaydi.
 
-GitHub'ga push qilinganidan keyin GitPulse Telegram Bot API orqali notification yuboradi.
+**GitHub webhook** (Settings → Webhooks → Add webhook):
 
-Developer GitHub'ni doimiy ravishda tekshirib o'tirmaydi.
+| Maydon | Qiymat |
+|---|---|
+| Payload URL | `https://<manzil>/webhook/github/gp_xxxxxxxx` |
+| Content type | `application/json` |
+| Secret | `gp_xxxxxxxx` |
+| Events | Just the push event |
 
-Notification avtomatik keladi.
+### 3. Tekshiring
 
----
-
-## 3. Real Commit Data
-
-GitPulse commit ma'lumotlarini GitHub webhook payload'idan avtomatik oladi.
-
-Quyidagi ma'lumotlar ishlatiladi:
-
-- Project name
-- Author
-- Branch
-- Commit message
-- Commit ID
-- Commit URL
-- Commit time
-- Added files
-- Modified files
-- Removed files
-- Total changed files
-
-Ma'lumotlar hardcode qilinmaydi.
+Botga `/channels` yozing — kanal va unga bog'langan loyihalar ko'rinadi.
 
 ---
 
-## 4. Multi-Project Support
+## 🤖 Bot buyruqlari
 
-GitPulse faqat bitta project uchun emas.
+| Buyruq | Nima qiladi |
+|---|---|
+| `/projects` | Ro'yxatdagi loyihalar |
+| `/channels` | Kanallar, kalitlari va bog'langan loyihalar |
+| `/bind <loyiha> <raqam>` | Loyihani kanalga qo'lda bog'laydi |
+| `/unbind <loyiha>` | Bog'lanishni uzadi |
+| `/help` | Yordam |
 
-Bitta GitPulse instance orqali bir nechta GitHub repository'larini kuzatish mumkin.
-
-Masalan:
-
-- Rent-House
-- Go-Backend
-- Portfolio
-- Telegram-Bot
-- E-Commerce
-- boshqa GitHub repository'lar
-
-Har bir repository GitPulse'ga o'z webhook'i orqali ulanadi.
-
-Telegram notification ichida project nomi ko'rsatiladi.
-
-Masalan:
-
-📦 Project
-Rent-House
-
-yoki:
-
-📦 Project
-Go-Backend
+`/bind` kalit o'rnatilmagan eski loyihalar uchun qulay: push kalitsiz kelsa ham
+loyiha nomi bo'yicha to'g'ri kanalga tushadi.
 
 ---
 
-# 💡 GitPulse qanday ishlaydi?
+## ⚙️ Ishga tushirish
 
-GitPulse quyidagi pipeline orqali ishlaydi:
+```sh
+~/Desktop/gitpulse/gitpulse/scripts/run.sh
+```
 
-GitHub Repository
-        ↓
-GitHub Webhook
-        ↓
-ngrok / Production Server
-        ↓
-Go HTTP Server
-        ↓
-JSON Parser
-        ↓
-GitHub Event Handler
-        ↓
-Telegram Bot API
-        ↓
-Telegram Notification
+Terminalda yangi oyna ochib shuni yozish kifoya. Skript `.env` va PostgreSQL
+turganini tekshiradi, keyin serverni ko'taradi.
 
----
+Qo'lda:
 
-# 🧠 Nima uchun GitPulse kerak?
-
-Oddiy holatda developer GitHub activity'ni tekshirish uchun:
-
-GitHub → Repository → Commits
-
-bo'limiga kirishi kerak.
-
-GitPulse esa bu jarayonni avtomatlashtiradi:
-
-git push
-    ↓
-Telegram notification
-
-Shuning uchun developer:
-
-- GitHub'ni doimiy tekshirib o'tirmaydi
-- Qaysi project o'zgarganini tez biladi
-- Kim push qilganini ko'radi
-- Qaysi branch o'zgarganini ko'radi
-- Commit message'ni ko'radi
-- Qancha file o'zgarganini ko'radi
-- Commit'ga to'g'ridan-to'g'ri o'tishi mumkin
-
----
-
-# 🏗️ Architecture
-
-Hozirgi architecture:
-
-Developer
-    │
-    │ git push
-    ▼
-GitHub
-    │
-    │ Webhook
-    ▼
-ngrok
-    │
-    │ HTTP POST
-    ▼
-GitPulse
-    │
-    │ Telegram Bot API
-    ▼
-Telegram
-
-Production'da ngrok o'rniga public server ishlatiladi.
-
----
-
-# 🛠️ Tech Stack
-
-## Backend
-
-- Go
-- net/http
-- encoding/json
-- net/url
-- html
-- time
-- logging
-
-## External Services
-
-- GitHub Webhooks
-- Telegram Bot API
-- ngrok
-
-## Configuration
-
-- Environment Variables
-- `.env`
-
----
-
-# 📂 Project Structure
-
-Hozirgi project structure:
-
-GitPulse/
-│
-├── main.go
-├── go.mod
-├── go.sum
-├── .env
-├── .gitignore
-└── README.md
-
-Project rivojlangani sari modular architecture'ga o'tkaziladi:
-
-GitPulse/
-│
-├── cmd/
-│   └── server/
-│       └── main.go
-│
-├── internal/
-│   ├── github/
-│   ├── telegram/
-│   ├── webhook/
-│   ├── notification/
-│   └── config/
-│
-├── .env
-├── .gitignore
-├── go.mod
-├── go.sum
-└── README.md
-
----
-
-# ⚙️ Environment Variables
-
-GitPulse sensitive ma'lumotlarni environment variables orqali oladi.
-
-`.env`:
-
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-
-`.env` fayli GitHub repository'ga push qilinmasligi kerak.
-
-`.gitignore`:
-
-.env
-
----
-
-# 🚀 Local Development
-
-## 1. Repository'ni clone qilish
-
-git clone https://github.com/USERNAME/GitPulse.git
-
-cd GitPulse
-
-## 2. Dependencies
-
-go mod download
-
-## 3. `.env` yaratish
-
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-
-## 4. Serverni ishga tushirish
-
+```sh
+cd ~/Desktop/gitpulse/gitpulse
 go run .
+```
 
-Server:
+### `.env`
 
-http://localhost:8080
+```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...        # shaxsiy chat: kalitlar va kanalsiz loyihalar shu yerga
+GITHUB_WEBHOOK_SECRET=...   # eski, kalitsiz webhook'lar uchun
+DATABASE_URL=postgres://.../gitpulse?sslmode=disable
+PORT=8080
+PUBLIC_BASE_URL=            # ixtiyoriy: ngrok/tunnel manzili, ko'rsatmalarda ishlatiladi
+```
 
-manzilida ishlaydi.
+### ngrok
 
----
+GitHub `localhost`ga so'rov yubora olmaydi:
 
-# 🔌 API Endpoints
-
-## Health Check
-
-GET /health
-
-Response:
-
-GitPulse is running
-
----
-
-## GitHub Webhook
-
-POST /webhook/github
-
-GitHub push eventlari shu endpoint orqali qabul qilinadi.
-
----
-
-# 🌐 ngrok bilan ishlash
-
-Development vaqtida GitHub localhost'ga request yubora olmaydi.
-
-Shuning uchun ngrok ishlatiladi:
-
+```sh
 ngrok http 8080
+```
 
-Ngrok public URL beradi:
-
-https://example.ngrok-free.dev
-
-GitHub webhook URL:
-
-https://example.ngrok-free.dev/webhook/github
+Bepul ngrok manzili har qayta ishga tushganda o'zgaradi — shuning uchun lokal
+`pre-push` hook ishonchliroq yo'l. Barqaror manzil kerak bo'lsa: Cloudflare
+Tunnel yoki doimiy server.
 
 ---
 
-# 🔗 GitHub Webhook Setup
+## 🔌 Endpointlar
 
-GitHub repository:
-
-Settings
-    ↓
-Webhooks
-    ↓
-Add webhook
-
-Payload URL:
-
-https://YOUR-NGROK-URL/webhook/github
-
-Content type:
-
-application/json
-
-Events:
-
-Just the push event
-
-Active:
-
-Enabled
+| Metod | Yo'l | Izoh |
+|---|---|---|
+| GET | `/health` | Server va baza holati |
+| POST | `/webhook/github/<kalit>` | Kalitli webhook — kanal kalitdan aniqlanadi |
+| POST | `/webhook/github` | Eski yo'l: umumiy sir, kanal loyiha nomi bo'yicha |
 
 ---
 
-# 📱 Telegram Notification
+## 🗄 Ma'lumotlar bazasi
 
-GitHub'da push bo'lganda Telegram bot notification yuboradi:
+| Jadval | Nima saqlaydi |
+|---|---|
+| `projects` | Ko'rilgan loyihalar (nomi, `owner/repo`, GitHub manzili) |
+| `channels` | Ulangan kanallar va kalitlari |
+| `project_channels` | Qaysi loyiha qaysi kanalga tushadi |
+| `project_topics` | Kanalsiz loyihalar uchun shaxsiy chatdagi topiclar |
 
+Sxema ishga tushganda avtomatik yaratiladi.
+
+---
+
+## 🔐 Xavfsizlik
+
+- Har bir so'rov HMAC-SHA256 bilan tekshiriladi (`X-Hub-Signature-256`)
+- Har bir kanalning kaliti alohida — umumiy sir emas
+- Noma'lum kalit yoki noto'g'ri imzo → `401`
+- Kalit kanalga emas, shaxsiy chatga yuboriladi
+- `.env` va `.git/config` commit'ga tushmaydi
+
+---
+
+## 📁 Struktura
+
+```
+gitpulse/
+├── main.go        HTTP server, GitHub webhook, Telegram bot
+├── channels.go    Kanal registri, kalitlar, yo'naltirish
+├── topics.go      Shaxsiy chatdagi topiclar (kanalsiz loyihalar uchun)
+├── scripts/
+│   ├── run.sh             ishga tushirish
+│   ├── install-hook.sh    pre-push hook'ni istalgan loyihaga o'rnatish
+│   └── gitpulse-notify.sh hook chaqiradigan xabarchi
+├── .env
+└── go.mod
+```
+
+---
+
+## 📱 Xabar ko'rinishi
+
+```
 🚀 PUSH
 
-📦 Project
-Rent-House
+📦 uyjoy
+🌿 main
 
-👤 Author
-samandar-hodiev
+👤 samandar-hodiev
 
-🌿 Branch
-main
+📝 fix(console): grafikdagi kalendar — dropdown
+🔖 0c92b24
 
-📝 Commit
-feat: add apartment recommendations
-
-🔖 Commit ID
-a0aa5b1
+📚 Shu push'dagi yana 2 commit
+• 5b149a4 fix(auth): til almashganda ekran lipillamaydi
+• 6ca982c feat(console): bosh panel grafigi
 
 📊 Changes
-• 3 files changed
-• 🟢 1 added
-• 🟡 2 modified
-• 🔴 0 removed
+🟢 1 added  •  🟡 3 modified  •  🔴 0 removed
+📁 4 files changed
 
-🕐 Time
-17.08.2026 15:38:32
+🕐 20.11.2026 18:03
 
 🔗 View commit on GitHub
+```
 
-Telegram link preview o'chirilgan, shuning uchun notification faqat kerakli ma'lumotlarni ko'rsatadi.
-
----
-
-# 🔐 Security
-
-Webhook security GitPulse'ning muhim qismlaridan biri.
-
-Rejalashtirilgan security:
-
-- GitHub Webhook Secret
-- `X-Hub-Signature-256` verification
-- Fake webhook request'larni bloklash
-- Request validation
-- Environment variables orqali secretlarni saqlash
-- Telegram Bot Token'ni himoyalash
-- Database credentials'ni himoyalash
-
-Sensitive ma'lumotlar Git repository'ga commit qilinmasligi kerak.
+Bitta push'da bir nechta commit bo'lsa, hammasi bitta xabarda ko'rinadi —
+kanal o'nta kartochka bilan to'lib ketmaydi.
 
 ---
 
-# 🎯 Roadmap
+## ✅ Holat
 
-## Phase 1 — Core
-
-- [x] Go HTTP server
-- [x] GitHub Webhook
-- [x] GitHub push event
-- [x] JSON payload parsing
-- [x] Real commit data
-- [x] Telegram Bot API
-- [x] Telegram notification
-- [x] Project name detection
-- [x] Branch detection
-- [x] Commit information
-- [x] File change statistics
-- [x] GitHub commit link
-- [x] Disable Telegram link preview
-- [x] Multi-project architecture
-
-## Phase 2 — Security
-
-- [ ] GitHub Webhook Secret
-- [ ] `X-Hub-Signature-256` verification
-- [ ] Invalid webhook rejection
-- [ ] Request validation
-- [ ] Better error handling
-- [ ] Logging
-
-## Phase 3 — Telegram Bot
-
-- [ ] `/start`
-- [ ] `/help`
-- [ ] `/projects`
-- [ ] Project list
-- [ ] Project filtering
-- [ ] Project enable/disable
-- [ ] Notification settings
-
-## Phase 4 — Better Notifications
-
-- [ ] Better Telegram UI
-- [ ] Inline buttons
-- [ ] Commit buttons
-- [ ] Project-specific formatting
-- [ ] Push summary
-- [ ] Multiple commits in one push
-- [ ] Better change statistics
-- [ ] File change list
-
-## Phase 5 — Database
-
-- [ ] PostgreSQL
-- [ ] Project model
-- [ ] User model
-- [ ] Telegram chat model
-- [ ] Webhook configuration
-- [ ] Project settings
-- [ ] Notification history
-
-## Phase 6 — Production
-
-- [ ] Production server
-- [ ] HTTPS
-- [ ] Domain
-- [ ] Docker
-- [ ] CI/CD
-- [ ] Environment management
-- [ ] Monitoring
-- [ ] Logging
-- [ ] Automatic deployment
-
----
-
-# 🔮 Future Features
-
-GitPulse kelajakda oddiy GitHub → Telegram notification botdan to'liq developer activity monitoring tool'ga aylanishi mumkin.
-
-Kelajakdagi imkoniyatlar:
-
-- Commit statistics
-- Daily development summary
-- Weekly development summary
-- Project activity statistics
-- Multiple developers
-- Multiple Telegram users
-- Pull Request notifications
-- Issue notifications
-- Branch notifications
-- Deployment notifications
-- CI/CD status notifications
-- GitHub Actions notifications
-- Failed build alerts
-- Project analytics
-
----
-
-# 💼 Real-world Use Case
-
-Developer bir nechta project bilan ishlaydi:
-
-- Rent-House
-- E-Commerce
-- Go API
-- Telegram Bot
-- Portfolio
-
-Developer har safar:
-
-git push
-
-qilganda GitPulse Telegramga avtomatik notification yuboradi.
-
-Shunday qilib developer Telegram orqali barcha projectlaridagi activity'ni kuzatishi mumkin.!!!
-
----
-
-
-# 📌 Project Status
-
-🚧 GitPulse hozir development bosqichida.
-
-Current status:!
-
-GitHub Webhook        ✅
-Telegram Notification ✅
-Real Commit Data      ✅
-Multi-Project         ✅
-Link Preview Removal  ✅
-Webhook Security      🚧
-Telegram Commands     🚧
-Database              ⬜
-Production Deploy     ⬜
+| | |
+|---|---|
+| GitHub webhook | ✅ |
+| Telegram xabar | ✅ |
+| Ko'p loyiha | ✅ |
+| Kanal bo'yicha yo'naltirish | ✅ |
+| Kalit bilan ulanish | ✅ |
+| Webhook xavfsizligi (HMAC) | ✅ |
+| Dublikatni bostirish | ✅ |
+| PostgreSQL | ✅ |
+| Bot buyruqlari | ✅ |
+| Lokal pre-push hook | ✅ |
+| Rate limit (429) ishlovi | ✅ |
+| Testlar | ⬜ |
+| Doimiy server / tunnel | ⬜ |
+| Pull Request, Issue, CI xabarlari | ⬜ |

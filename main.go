@@ -31,11 +31,17 @@ type GitHubPayload struct {
 	Ref string `json:"ref"`
 
 	Repository struct {
-		Name    string `json:"name"`
-		HTMLURL string `json:"html_url"`
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		HTMLURL  string `json:"html_url"`
 	} `json:"repository"`
 
 	HeadCommit *Commit `json:"head_commit"`
+
+	// Commits — push ichidagi barcha commitlar (GitHub ko'pi bilan 20 tasini
+	// yuboradi). Faqat head_commit'ni olish bitta push'da bir nechta commit
+	// bo'lganda qolganlarini ko'rinmas qilardi.
+	Commits []Commit `json:"commits"`
 }
 
 type Commit struct {
@@ -59,8 +65,14 @@ type Commit struct {
 // ============================================================
 
 type TelegramUpdate struct {
-	UpdateID int64             `json:"update_id"`
-	Message  *TelegramMessage  `json:"message"`
+	UpdateID int64 `json:"update_id"`
+
+	Message     *TelegramMessage `json:"message"`
+	ChannelPost *TelegramMessage `json:"channel_post"`
+
+	// MyChatMember bot biror chatga qo'shilgani yoki admin qilinganida
+	// keladi. Kanalni avtomatik ro'yxatga olish shunga tayanadi.
+	MyChatMember *ChatMemberUpdated `json:"my_chat_member"`
 }
 
 type TelegramMessage struct {
@@ -70,8 +82,22 @@ type TelegramMessage struct {
 }
 
 type TelegramChat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID    int64  `json:"id"`
+	Type  string `json:"type"`
+	Title string `json:"title"`
+}
+
+type TelegramUser struct {
+	ID int64 `json:"id"`
+}
+
+type ChatMemberUpdated struct {
+	Chat TelegramChat `json:"chat"`
+	From TelegramUser `json:"from"`
+
+	NewChatMember struct {
+		Status string `json:"status"`
+	} `json:"new_chat_member"`
 }
 
 // ============================================================
@@ -90,9 +116,26 @@ type Config struct {
 	GitHubWebhookSecret string
 	DatabaseURL         string
 	Port                string
+
+	// PublicBaseURL — GitHub ko'radigan manzil (ngrok yoki tunnel URL'i).
+	// Faqat ko'rsatma matnlarida ishlatiladi.
+	PublicBaseURL string
 }
 
 var config Config
+
+// ScriptsDir — install-hook.sh turgan papka. Ko'rsatma matnida to'liq yo'l
+// ko'rinsin uchun ishchi papkadan olinadi.
+func (c Config) ScriptsDir() string {
+
+	wd, err := os.Getwd()
+
+	if err != nil {
+		return "scripts"
+	}
+
+	return wd + "/scripts"
+}
 
 // ============================================================
 // MAIN
@@ -139,8 +182,15 @@ func main() {
 	// HTTP ROUTES
 	// --------------------------------------------------------
 
-	http.HandleFunc("/health", health)
-	http.HandleFunc("/webhook/github", githubWebhook)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", health)
+
+	// Eski yo'l: umumiy sir bilan imzolangan, kanal loyiha nomi bo'yicha
+	// topiladi. Yangi yo'l: /webhook/github/<kalit> — imzo ham, kanal ham
+	// o'sha kalitdan keladi.
+	mux.HandleFunc("/webhook/github", githubWebhook)
+	mux.HandleFunc("/webhook/github/", githubWebhook)
 
 	// --------------------------------------------------------
 	// TELEGRAM BOT
@@ -157,12 +207,18 @@ func main() {
 		config.Port,
 	)
 
-	log.Fatal(
-		http.ListenAndServe(
-			":"+config.Port,
-			nil,
-		),
-	)
+	// Timeout'lar: timeout'siz server sekin yoki osilib qolgan ulanishda
+	// goroutine va fayl deskriptorlarini ushlab turadi.
+	server := &http.Server{
+		Addr:              ":" + config.Port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	log.Fatal(server.ListenAndServe())
 }
 
 // ============================================================
@@ -177,6 +233,7 @@ func loadConfig() {
 		GitHubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		DatabaseURL:         os.Getenv("DATABASE_URL"),
 		Port:                os.Getenv("PORT"),
+		PublicBaseURL:       os.Getenv("PUBLIC_BASE_URL"),
 	}
 
 	if config.TelegramBotToken == "" {
@@ -197,6 +254,10 @@ func loadConfig() {
 
 	if config.Port == "" {
 		config.Port = "8080"
+	}
+
+	if config.PublicBaseURL == "" {
+		config.PublicBaseURL = "http://localhost:" + config.Port
 	}
 }
 
@@ -263,6 +324,9 @@ func initDatabaseSchema() error {
 	migration := `
 	ALTER TABLE projects
 	ADD COLUMN IF NOT EXISTS github_url TEXT NOT NULL DEFAULT '';
+
+	ALTER TABLE projects
+	ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT '';
 	`
 
 	if _, err := db.Exec(migration); err != nil {
@@ -270,6 +334,10 @@ func initDatabaseSchema() error {
 	}
 
 	if err := initTopicsSchema(); err != nil {
+		return err
+	}
+
+	if err := initChannelsSchema(); err != nil {
 		return err
 	}
 
@@ -348,12 +416,18 @@ var (
 	seenCommits = map[string]time.Time{}
 )
 
-// alreadyAnnounced reports whether this commit has already been announced inside the
-// window, and records it when it has not.
+// reserveAnnouncement bu commit hali e'lon qilinmaganini tekshiradi va uni
+// band qilib qo'yadi. Band qilish — yuborishdan OLDIN, chunki ikkita nusxa
+// (GitHub va lokal hook) bir vaqtda kelishi mumkin.
 //
-// Expired entries are dropped on the way through, so the map stays the size of recent
-// activity instead of growing for the life of the process.
-func alreadyAnnounced(
+// Muvaffaqiyatsiz yuborishdan keyin releaseAnnouncement chaqirilishi shart:
+// aks holda GitHub'dagi "Redeliver" tugmasi 10 daqiqa davomida "duplicate"
+// deb rad etiladi va xabar butunlay yo'qoladi.
+//
+// Xotirada saqlanadi, bazada emas: qayta ishga tushganda bitta dublikat
+// o'tib ketishi mumkin, bu esa bir necha daqiqadan keyin keraksiz bo'lib
+// qoladigan holat uchun alohida jadval va migratsiyadan arzonroq.
+func reserveAnnouncement(
 	key string,
 ) bool {
 
@@ -372,12 +446,38 @@ func alreadyAnnounced(
 	if at, ok := seenCommits[key]; ok &&
 		now.Sub(at) <= duplicateWindow {
 
-		return true
+		return false
 	}
 
 	seenCommits[key] = now
 
-	return false
+	return true
+}
+
+func releaseAnnouncement(
+	key string,
+) {
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+
+	delete(seenCommits, key)
+}
+
+// webhookKey /webhook/github/<kalit> yo'lidan kalitni ajratib oladi.
+// Eski /webhook/github yo'li uchun bo'sh satr qaytadi.
+func webhookKey(path string) string {
+
+	const prefix = "/webhook/github/"
+
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+
+	return strings.Trim(
+		strings.TrimPrefix(path, prefix),
+		"/",
+	)
 }
 
 func githubWebhook(
@@ -414,6 +514,49 @@ func githubWebhook(
 	}
 
 	// --------------------------------------------------------
+	// KANAL KALITI
+	// --------------------------------------------------------
+	//
+	// Kalit bo'lsa — imzo o'sha kalit bilan tekshiriladi va xabar o'sha
+	// kalitga tegishli kanalga boradi. Kalitsiz so'rov eski umumiy sir
+	// bilan tekshiriladi va kanal loyiha nomi bo'yicha topiladi.
+
+	key := webhookKey(r.URL.Path)
+
+	if key == "" {
+		key = strings.TrimSpace(
+			r.Header.Get("X-GitPulse-Key"),
+		)
+	}
+
+	secret := config.GitHubWebhookSecret
+
+	var keyedChannel *Channel
+
+	if key != "" {
+
+		channel, err := channelByKey(key)
+
+		if err != nil {
+
+			log.Println(
+				"❌ Noma'lum kanal kaliti",
+			)
+
+			http.Error(
+				w,
+				"Unknown channel key",
+				http.StatusUnauthorized,
+			)
+
+			return
+		}
+
+		keyedChannel = &channel
+		secret = key
+	}
+
+	// --------------------------------------------------------
 	// GITHUB SIGNATURE
 	// --------------------------------------------------------
 
@@ -424,6 +567,7 @@ func githubWebhook(
 	if !verifyGitHubSignature(
 		body,
 		signature,
+		secret,
 	) {
 
 		log.Println(
@@ -547,12 +691,24 @@ func githubWebhook(
 		payload.Repository.HTMLURL,
 	)
 
+	// To'liq nom ("owner/repo") loyihani aniq ajratadi: turli egadagi bir xil
+	// nomli repo'lar bir-birining kanaliga tushmaydi. Lokal hook uni
+	// yubormasa, repo manzilidan tiklanadi.
+	fullName := strings.TrimSpace(
+		payload.Repository.FullName,
+	)
+
+	if fullName == "" {
+		fullName = fullNameFromURL(githubURL)
+	}
+
 	// --------------------------------------------------------
 	// REGISTER PROJECT
 	// --------------------------------------------------------
 
 	if err := registerProject(
 		project,
+		fullName,
 		githubURL,
 	); err != nil {
 
@@ -582,12 +738,47 @@ func githubWebhook(
 	commit := *payload.HeadCommit
 
 	// --------------------------------------------------------
+	// KANAL
+	// --------------------------------------------------------
+
+	channel, routed, err := routeFor(
+		keyedChannel,
+		fullName,
+		project,
+	)
+
+	if err != nil {
+
+		log.Println(
+			"❌ Kanalni aniqlash xatosi:",
+			err,
+		)
+
+		http.Error(
+			w,
+			"Database error",
+			http.StatusInternalServerError,
+		)
+
+		return
+	}
+
+	destination := "default"
+
+	if routed {
+		destination = channel.ChatID
+	}
+
+	// --------------------------------------------------------
 	// DUPLICATE
 	// --------------------------------------------------------
 
-	if alreadyAnnounced(
-		branch + "@" + commit.ID,
-	) {
+	dedupKey :=
+		destination +
+			"@" + branch +
+			"@" + commit.ID
+
+	if !reserveAnnouncement(dedupKey) {
 
 		log.Println(
 			"🔁 Duplicate push ignored:",
@@ -607,9 +798,14 @@ func githubWebhook(
 	// CHANGES
 	// --------------------------------------------------------
 
-	added := len(commit.Added)
-	modified := len(commit.Modified)
-	removed := len(commit.Removed)
+	// Push ichidagi barcha commitlar hisobga olinadi, faqat oxirgisi emas.
+	commits := payload.Commits
+
+	if len(commits) == 0 {
+		commits = []Commit{commit}
+	}
+
+	added, modified, removed := changeCounts(commits)
 
 	totalFiles :=
 		added +
@@ -624,6 +820,7 @@ func githubWebhook(
 		project,
 		branch,
 		commit,
+		commits,
 		totalFiles,
 		added,
 		modified,
@@ -659,18 +856,43 @@ func githubWebhook(
 		commit.ID,
 	)
 
+	log.Println(
+		"📣 Kanal:",
+		destination,
+	)
+
 	// --------------------------------------------------------
 	// SEND TELEGRAM
 	// --------------------------------------------------------
 
-	if err := sendProjectNotification(
-		project,
-		message,
-	); err != nil {
+	var sendErr error
+
+	if routed {
+
+		// Kanalda topic yo'q: xabar to'g'ridan-to'g'ri kanalga boradi.
+		sendErr = sendToThread(
+			channel.ChatID,
+			0,
+			message,
+		)
+
+	} else {
+
+		sendErr = sendProjectNotification(
+			project,
+			message,
+		)
+	}
+
+	if sendErr != nil {
+
+		// Band qilishni bo'shatamiz, aks holda GitHub'dagi "Redeliver"
+		// 10 daqiqa davomida dublikat deb rad etiladi.
+		releaseAnnouncement(dedupKey)
 
 		log.Println(
 			"❌ Telegram error:",
-			err,
+			sendErr,
 		)
 
 		http.Error(
@@ -694,22 +916,138 @@ func githubWebhook(
 }
 
 // ============================================================
+// YO'NALTIRISH
+// ============================================================
+
+// routeFor push qaysi kanalga tushishini aniqlaydi.
+//
+// Kalit bilan kelgan so'rov o'sha kalitning kanaliga boradi va bir vaqtning
+// o'zida loyihani shu kanalga bog'lab qo'yadi — shundan keyin kalitsiz
+// kelgan so'rov (masalan lokal pre-push hook) ham to'g'ri kanalga tushadi.
+func routeFor(
+	keyed *Channel,
+	fullName string,
+	name string,
+) (Channel, bool, error) {
+
+	if keyed != nil {
+
+		target := fullName
+
+		if target == "" {
+			target = name
+		}
+
+		if err := bindProject(
+			target,
+			keyed.ChatID,
+		); err != nil {
+
+			log.Println(
+				"⚠️ Loyihani kanalga bog'lab bo'lmadi:",
+				err,
+			)
+		}
+
+		return *keyed, true, nil
+	}
+
+	return channelForProject(fullName, name)
+}
+
+// fullNameFromURL "https://github.com/owner/repo" dan "owner/repo" ni oladi.
+func fullNameFromURL(githubURL string) string {
+
+	trimmed := strings.TrimSuffix(
+		strings.TrimSuffix(githubURL, "/"),
+		".git",
+	)
+
+	parts := strings.Split(trimmed, "/")
+
+	if len(parts) < 2 {
+		return ""
+	}
+
+	owner := parts[len(parts)-2]
+	repo := parts[len(parts)-1]
+
+	if owner == "" || repo == "" || strings.Contains(owner, ":") {
+		return ""
+	}
+
+	return owner + "/" + repo
+}
+
+// changeCounts push ichidagi barcha commitlar bo'yicha o'zgargan fayllarni
+// sanaydi. Bitta fayl bir necha commitda tegilgan bo'lsa, bir marta
+// sanaladi — "12 fayl o'zgardi" deganda odam shuni tushunadi.
+func changeCounts(
+	commits []Commit,
+) (int, int, int) {
+
+	added := map[string]bool{}
+	modified := map[string]bool{}
+	removed := map[string]bool{}
+
+	for _, commit := range commits {
+
+		for _, path := range commit.Added {
+			added[path] = true
+		}
+
+		for _, path := range commit.Modified {
+			modified[path] = true
+		}
+
+		for _, path := range commit.Removed {
+			removed[path] = true
+		}
+	}
+
+	// Qo'shilgan keyin o'chirilgan fayl ikki marta sanalmasin.
+	for path := range removed {
+		delete(added, path)
+		delete(modified, path)
+	}
+
+	for path := range added {
+		delete(modified, path)
+	}
+
+	return len(added), len(modified), len(removed)
+}
+
+// ============================================================
 // PROJECT REGISTRY
 // ============================================================
 
 func registerProject(
 	project string,
+	fullName string,
 	githubURL string,
 ) error {
+
+	// Repo nomi o'zgarsa ("sat-platform" → "Sat-Platform") jadvalda ikkita
+	// qator paydo bo'lardi, chunki kalit registrga sezgir. Eski yozuvni
+	// o'chirib, faqat oxirgi yozilishini qoldiramiz.
+	if _, err := db.Exec(
+		`DELETE FROM projects WHERE lower(name) = lower($1) AND name <> $1`,
+		project,
+	); err != nil {
+		return err
+	}
 
 	query := `
 		INSERT INTO projects (
 			name,
+			full_name,
 			github_url
 		)
-		VALUES ($1, $2)
+		VALUES ($1, $2, $3)
 		ON CONFLICT (name)
 		DO UPDATE SET
+			full_name = EXCLUDED.full_name,
 			github_url = EXCLUDED.github_url,
 			updated_at = NOW()
 	`
@@ -717,6 +1055,7 @@ func registerProject(
 	_, err := db.Exec(
 		query,
 		project,
+		fullName,
 		githubURL,
 	)
 
@@ -796,10 +1135,8 @@ func getProjects() ([]Project, error) {
 func verifyGitHubSignature(
 	body []byte,
 	signature string,
+	secret string,
 ) bool {
-
-	secret :=
-		config.GitHubWebhookSecret
 
 	if secret == "" {
 		return false
@@ -877,6 +1214,7 @@ func formatTelegramMessage(
 	project string,
 	branch string,
 	commit Commit,
+	commits []Commit,
 	totalFiles int,
 	added int,
 	modified int,
@@ -984,7 +1322,8 @@ func formatTelegramMessage(
 			"🌿 <code>%s</code>\n\n"+
 			"👤 %s\n\n"+
 			"📝 <b>%s</b>\n"+
-			"🔖 <code>%s</code>\n\n"+
+			"🔖 <code>%s</code>\n"+
+			"%s\n"+
 			"📊 <b>Changes</b>\n"+
 			"🟢 %d added  •  "+
 			"🟡 %d modified  •  "+
@@ -1000,6 +1339,7 @@ func formatTelegramMessage(
 		author,
 		commitMessage,
 		commitID,
+		otherCommitsBlock(commit, commits),
 		added,
 		modified,
 		removed,
@@ -1008,6 +1348,93 @@ func formatTelegramMessage(
 		commitTime,
 		commitURL,
 	)
+}
+
+// maxListedCommits — bitta xabarda sanab o'tiladigan qo'shimcha commitlar
+// soni. Qolganlari "+N ta yana" bo'lib ko'rsatiladi.
+const maxListedCommits = 5
+
+// otherCommitsBlock bitta push'da bir nechta commit bo'lganda qolganlarini
+// qisqa ro'yxat qilib qaytaradi. Bitta commit bo'lsa — bo'sh satr.
+//
+// Har bir commit uchun alohida xabar yuborilmaydi: o'nta commitli push
+// kanalni o'nta kartochka bilan to'ldirib yuborardi.
+func otherCommitsBlock(
+	head Commit,
+	commits []Commit,
+) string {
+
+	var others []Commit
+
+	for _, c := range commits {
+		if c.ID != head.ID {
+			others = append(others, c)
+		}
+	}
+
+	if len(others) == 0 {
+		return ""
+	}
+
+	// GitHub commitlarni eskidan yangiga qarab yuboradi; oxirgisi head.
+	// Ro'yxat yangidan eskiga qarab o'qilgani qulayroq.
+	for i, j := 0, len(others)-1; i < j; i, j = i+1, j-1 {
+		others[i], others[j] = others[j], others[i]
+	}
+
+	hidden := 0
+
+	if len(others) > maxListedCommits {
+		hidden = len(others) - maxListedCommits
+		others = others[:maxListedCommits]
+	}
+
+	var builder strings.Builder
+
+	builder.WriteString(
+		fmt.Sprintf(
+			"\n📚 <b>Shu push'dagi yana %d commit</b>\n",
+			len(others)+hidden,
+		),
+	)
+
+	for _, c := range others {
+
+		shortID := c.ID
+
+		if len(shortID) > 7 {
+			shortID = shortID[:7]
+		}
+
+		subject := strings.TrimSpace(c.Message)
+
+		if index := strings.IndexAny(subject, "\r\n"); index >= 0 {
+			subject = subject[:index]
+		}
+
+		subject = truncateRunes(subject, 80)
+
+		if subject == "" {
+			subject = "(xabarsiz)"
+		}
+
+		builder.WriteString(
+			fmt.Sprintf(
+				"• <code>%s</code> %s\n",
+				html.EscapeString(shortID),
+				html.EscapeString(subject),
+			),
+		)
+	}
+
+	if hidden > 0 {
+
+		builder.WriteString(
+			fmt.Sprintf("• +%d ta yana\n", hidden),
+		)
+	}
+
+	return builder.String()
 }
 
 // ============================================================
@@ -1019,11 +1446,6 @@ func sendTelegramMessageToChat(
 	message string,
 	showKeyboard bool,
 ) error {
-
-	apiURL :=
-		"https://api.telegram.org/bot" +
-			config.TelegramBotToken +
-			"/sendMessage"
 
 	data := url.Values{}
 
@@ -1060,11 +1482,14 @@ func sendTelegramMessageToChat(
 						"text": "📦 Projects",
 					},
 					{
+						"text": "📣 Channels",
+					},
+					{
 						"text": "🛠 Help",
 					},
 				},
 			},
-			"resize_keyboard":  true,
+			"resize_keyboard":   true,
 			"one_time_keyboard": false,
 		}
 
@@ -1081,35 +1506,9 @@ func sendTelegramMessageToChat(
 		)
 	}
 
-	client := &http.Client{
-		Timeout: 50 * time.Second,
-	}
-
-	resp, err :=
-		client.PostForm(
-			apiURL,
-			data,
-		)
-
-	if err != nil {
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-
-		body, _ :=
-			io.ReadAll(resp.Body)
-
-		return fmt.Errorf(
-			"Telegram returned %s: %s",
-			resp.Status,
-			string(body),
-		)
-	}
-
-	return nil
+	// Bitta Telegram klienti ishlatiladi: xato formati, timeout va
+	// 429 (rate limit) ishlovi hamma joyda bir xil bo'lsin.
+	return telegramCall("sendMessage", data, nil)
 }
 
 // ============================================================
@@ -1145,19 +1544,31 @@ func startTelegramBot() {
 			continue
 		}
 
-		for _, update :=
-			range updates {
+		for _, update := range updates {
 
 			offset =
 				update.UpdateID + 1
 
-			if update.Message == nil {
-				continue
-			}
+			switch {
 
-			handleTelegramMessage(
-				update.Message,
-			)
+			case update.MyChatMember != nil:
+
+				handleMyChatMember(
+					update.MyChatMember,
+				)
+
+			case update.ChannelPost != nil:
+
+				handleChannelPost(
+					update.ChannelPost,
+				)
+
+			case update.Message != nil:
+
+				handleTelegramMessage(
+					update.Message,
+				)
+			}
 		}
 	}
 }
@@ -1190,6 +1601,15 @@ func getTelegramUpdates(
 		),
 	)
 
+	// my_chat_member — bot kanalga admin qilinganini bilish uchun; uni
+	// aniq so'ramasak ham Telegram yuboradi, lekin ro'yxatni ochiq yozib
+	// qo'ygan ma'qul: keyin yangi tur qo'shilsa, nega kelmayotgani
+	// darrov ko'rinadi.
+	params.Set(
+		"allowed_updates",
+		`["message","channel_post","my_chat_member"]`,
+	)
+
 	client := &http.Client{
 		Timeout: 50 * time.Second,
 	}
@@ -1220,7 +1640,7 @@ func getTelegramUpdates(
 	}
 
 	var response struct {
-		OK     bool              `json:"ok"`
+		OK     bool             `json:"ok"`
 		Result []TelegramUpdate `json:"result"`
 	}
 
@@ -1297,7 +1717,39 @@ func handleTelegramMessage(
 		text,
 	)
 
-	command :=
+	fields := strings.Fields(text)
+
+	command := ""
+	args := []string{}
+
+	if len(fields) > 0 {
+		command = strings.ToLower(fields[0])
+		command = strings.SplitN(command, "@", 2)[0]
+		args = fields[1:]
+	}
+
+	switch command {
+
+	case "/channels":
+
+		handleChannelsCommand(message)
+
+		return
+
+	case "/bind":
+
+		handleBindCommand(message, args)
+
+		return
+
+	case "/unbind":
+
+		handleUnbindCommand(message, args)
+
+		return
+	}
+
+	command =
 		strings.ToLower(text)
 
 	switch command {
@@ -1323,6 +1775,12 @@ func handleTelegramMessage(
 	case "📦 projects":
 
 		handleProjectsCommand(
+			message,
+		)
+
+	case "📣 channels":
+
+		handleChannelsCommand(
 			message,
 		)
 
@@ -1361,17 +1819,17 @@ func handleStartCommand(
 		)
 
 	text :=
-		"🚀 <b>GitPulse</b>\n\n"+
-			"GitHub repository monitoring bot.\n\n"+
-			"📡 GitHub push va commit'larni "+
-			"real-time Telegram notification'ga aylantiradi.\n\n"+
-			"📦 <b>Features</b>\n"+
-			"• GitHub Webhook\n"+
-			"• Multi-project\n"+
-			"• Webhook Security\n"+
-			"• PostgreSQL\n\n"+
-			"🛠 <b>Commands</b>\n"+
-			"/projects\n"+
+		"🚀 <b>GitPulse</b>\n\n" +
+			"GitHub repository monitoring bot.\n\n" +
+			"📡 GitHub push va commit'larni " +
+			"real-time Telegram notification'ga aylantiradi.\n\n" +
+			"📦 <b>Features</b>\n" +
+			"• GitHub Webhook\n" +
+			"• Multi-project\n" +
+			"• Webhook Security\n" +
+			"• PostgreSQL\n\n" +
+			"🛠 <b>Commands</b>\n" +
+			"/projects\n" +
 			"/help"
 
 	if err := sendTelegramMessageToChat(
@@ -1402,11 +1860,16 @@ func handleHelpCommand(
 		)
 
 	text :=
-		"🛠 <b>GitPulse Help</b>\n\n"+
-			"📦 <b>/projects</b>\n"+
-			"GitHub projectlar ro'yxatini ko'rsatadi.\n\n"+
-			"🔔 GitHub'dagi push'lar avtomatik ravishda "+
-			"Telegramga notification bo'lib keladi.\n\n"+
+		"🛠 <b>GitPulse Help</b>\n\n" +
+			"📦 <b>/projects</b> — loyihalar ro'yxati\n" +
+			"📣 <b>/channels</b> — ulangan kanallar va kalitlari\n" +
+			"🔗 <b>/bind &lt;loyiha&gt; &lt;raqam&gt;</b> — loyihani kanalga bog'lash\n" +
+			"✂️ <b>/unbind &lt;loyiha&gt;</b> — bog'lanishni uzish\n\n" +
+			"<b>Yangi loyihani ulash</b>\n" +
+			"1. Kanal oching va botni admin qiling\n" +
+			"2. Kalit shu yerga keladi (yoki kanalda <code>/connect</code> yozing)\n" +
+			"3. Kalitni GitHub webhook'iga yoki lokal hook'ga qo'ying\n\n" +
+			"Har bir loyihaning push'lari faqat o'z kanaliga tushadi.\n\n" +
 			"🔐 Webhook HMAC-SHA256 bilan himoyalangan."
 
 	if err := sendTelegramMessageToChat(
@@ -1483,8 +1946,7 @@ func handleProjectsCommand(
 		"📦 <b>Projects</b>\n\n",
 	)
 
-	for _, project :=
-		range projectList {
+	for _, project := range projectList {
 
 		name :=
 			html.EscapeString(

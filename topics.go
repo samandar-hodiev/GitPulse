@@ -216,10 +216,18 @@ func topicColor(project string) int {
 type telegramError struct {
 	Code        int
 	Description string
+
+	// RetryAfter — Telegram 429 bilan birga qaytaradigan kutish vaqti
+	// (soniyada).
+	RetryAfter int
 }
 
 func (e *telegramError) Error() string {
 	return fmt.Sprintf("Telegram %d: %s", e.Code, e.Description)
+}
+
+func (e *telegramError) retryAfter() time.Duration {
+	return time.Duration(e.RetryAfter) * time.Second
 }
 
 // threadGone reports that the topic the message was sent to no longer exists.
@@ -230,7 +238,54 @@ func (e *telegramError) threadGone() bool {
 		strings.Contains(d, "topic not found")
 }
 
+// maxTelegramRetries — 429 (rate limit) kelganda necha marta qayta urinish.
+// Ketma-ket push'larda Telegram "retry_after" bilan javob beradi; kutmasdan
+// voz kechish xabarni butunlay yo'qotardi.
+const maxTelegramRetries = 3
+
+// maxRetryWait — Telegram so'ragan kutish vaqtining yuqori chegarasi. Undan
+// uzunini kutish GitHub webhook so'rovini osilib qoldiradi.
+const maxRetryWait = 30 * time.Second
+
 func telegramCall(
+	method string,
+	data url.Values,
+	result any,
+) error {
+
+	var lastErr error
+
+	for attempt := 0; attempt <= maxTelegramRetries; attempt++ {
+
+		err := telegramCallOnce(method, data, result)
+
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		var tgErr *telegramError
+
+		if !errors.As(err, &tgErr) || tgErr.Code != 429 {
+			return err
+		}
+
+		wait := tgErr.retryAfter()
+
+		if wait <= 0 || wait > maxRetryWait {
+			return err
+		}
+
+		log.Println("⏳ Telegram rate limit, kutamiz:", wait)
+
+		time.Sleep(wait)
+	}
+
+	return lastErr
+}
+
+func telegramCallOnce(
 	method string,
 	data url.Values,
 	result any,
@@ -262,6 +317,10 @@ func telegramCall(
 		ErrorCode   int             `json:"error_code"`
 		Description string          `json:"description"`
 		Result      json.RawMessage `json:"result"`
+
+		Parameters struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
 	}
 
 	if err := json.Unmarshal(body, &envelope); err != nil {
@@ -269,7 +328,11 @@ func telegramCall(
 	}
 
 	if !envelope.OK {
-		return &telegramError{Code: envelope.ErrorCode, Description: envelope.Description}
+		return &telegramError{
+			Code:        envelope.ErrorCode,
+			Description: envelope.Description,
+			RetryAfter:  envelope.Parameters.RetryAfter,
+		}
 	}
 
 	if result != nil {
